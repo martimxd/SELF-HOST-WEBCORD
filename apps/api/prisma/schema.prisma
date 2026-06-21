@@ -1,0 +1,225 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ChannelType {
+  TEXT
+  VOICE
+  VIDEO
+}
+
+enum MemberRole {
+  OWNER
+  ADMIN
+  MODERATOR
+  MEMBER
+}
+
+enum FriendshipStatus {
+  PENDING
+  ACCEPTED
+}
+
+model User {
+  id                  String         @id @default(cuid())
+  username            String         @unique
+  avatarStoredName    String?
+  presenceMode        String         @default("ONLINE")
+  passwordHash        String
+  isSuperAdmin        Boolean        @default(false)
+  mustChangePassword  Boolean        @default(false)
+  suspended           Boolean        @default(false)
+  failedLoginAttempts Int            @default(0)
+  lockedUntil         DateTime?
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+  memberships         ServerMember[]
+  ownedServers        Server[]       @relation("ServerOwner")
+  serverInvites       ServerInvite[]
+  friendInvite        FriendInvite?
+  messages            Message[]
+  uploads             Upload[]
+  directConversationsA DirectConversation[] @relation("DirectUserA")
+  directConversationsB DirectConversation[] @relation("DirectUserB")
+  ownedDirectConversations DirectConversation[] @relation("DirectConversationOwner")
+  directMemberships   DirectConversationMember[]
+  directMessages       DirectMessage[]
+  sentFriendships      Friendship[] @relation("FriendshipRequester")
+  receivedFriendships  Friendship[] @relation("FriendshipAddressee")
+}
+
+model Server {
+  id          String         @id @default(cuid())
+  name        String
+  description String         @default("")
+  imageUrl    String?
+  ownerId     String
+  owner       User           @relation("ServerOwner", fields: [ownerId], references: [id])
+  members     ServerMember[]
+  channels    Channel[]
+  roles       Role[]
+  invites     ServerInvite[]
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+}
+
+model ServerInvite {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  serverId  String
+  creatorId String
+  server    Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  creator   User     @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@index([serverId])
+}
+
+model FriendInvite {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  ownerId   String   @unique
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+}
+
+model ServerMember {
+  id        String     @id @default(cuid())
+  userId    String
+  serverId  String
+  role      MemberRole @default(MEMBER)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  server    Server     @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  joinedAt  DateTime   @default(now())
+
+  @@unique([userId, serverId])
+}
+
+model Channel {
+  id        String      @id @default(cuid())
+  name      String
+  type      ChannelType @default(TEXT)
+  position  Int         @default(0)
+  isPrivate Boolean     @default(false)
+  serverId  String
+  server    Server      @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  messages  Message[]
+  uploads   Upload[]
+  createdAt DateTime    @default(now())
+}
+
+model Message {
+  id        String    @id @default(cuid())
+  content   String
+  editedAt  DateTime?
+  authorId  String
+  channelId String
+  replyToId String?
+  author    User      @relation(fields: [authorId], references: [id])
+  channel   Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  replyTo   Message?  @relation("MessageReplies", fields: [replyToId], references: [id])
+  replies   Message[] @relation("MessageReplies")
+  uploads   Upload[]
+  createdAt DateTime  @default(now())
+
+  @@index([channelId, createdAt])
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String
+  color       String   @default("#8b5cf6")
+  position    Int      @default(0)
+  permissions String[]
+  serverId    String
+  server      Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+}
+
+model Upload {
+  id           String   @id @default(cuid())
+  originalName String
+  storedName   String   @unique
+  mimeType     String
+  size         BigInt
+  userId       String
+  channelId    String?
+  directConversationId String?
+  messageId    String?
+  publicToken  String?  @unique
+  user         User     @relation(fields: [userId], references: [id])
+  channel      Channel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  directConversation DirectConversation? @relation(fields: [directConversationId], references: [id], onDelete: Cascade)
+  message      Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  createdAt    DateTime @default(now())
+}
+
+model Setting {
+  key   String @id
+  value String
+}
+
+model DirectConversation {
+  id        String          @id @default(cuid())
+  userAId   String?
+  userBId   String?
+  userA     User?           @relation("DirectUserA", fields: [userAId], references: [id], onDelete: Cascade)
+  userB     User?           @relation("DirectUserB", fields: [userBId], references: [id], onDelete: Cascade)
+  name      String?
+  isGroup   Boolean         @default(false)
+  ownerId   String?
+  owner     User?           @relation("DirectConversationOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  members   DirectConversationMember[]
+  messages  DirectMessage[]
+  uploads   Upload[]
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  @@unique([userAId, userBId])
+  @@index([userAId, updatedAt])
+  @@index([userBId, updatedAt])
+}
+
+model DirectConversationMember {
+  id             String             @id @default(cuid())
+  conversationId String
+  userId         String
+  conversation   DirectConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user           User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  joinedAt       DateTime           @default(now())
+
+  @@unique([conversationId, userId])
+  @@index([userId])
+}
+
+model DirectMessage {
+  id             String             @id @default(cuid())
+  content        String
+  authorId       String
+  conversationId String
+  author         User               @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  conversation   DirectConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  createdAt      DateTime           @default(now())
+  editedAt       DateTime?
+
+  @@index([conversationId, createdAt])
+}
+
+model Friendship {
+  id          String           @id @default(cuid())
+  requesterId String
+  addresseeId String
+  status      FriendshipStatus @default(PENDING)
+  requester   User             @relation("FriendshipRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  addressee   User             @relation("FriendshipAddressee", fields: [addresseeId], references: [id], onDelete: Cascade)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@unique([requesterId, addresseeId])
+  @@index([addresseeId, status])
+  @@index([requesterId, status])
+}

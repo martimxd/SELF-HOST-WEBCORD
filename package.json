@@ -1,0 +1,25 @@
+{
+  "name": "webcord",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "concurrently \"npm run dev -w @webcord/api\" \"npm run dev -w @webcord/web\"",
+    "build": "npm run build -w @webcord/shared && npm run build -w @webcord/api && npm run build -w @webcord/web",
+    "test": "npm run test -w @webcord/api",
+    "lint": "eslint . --ext .ts,.tsx",
+    "format": "prettier --write .",
+    "db:generate": "npm run db:generate -w @webcord/api",
+    "db:migrate": "npm run db:migrate -w @webcord/api",
+    "db:seed": "npm run db:seed -w @webcord/api"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "concurrently": "^8.2.2",
+    "eslint": "^8.57.0",
+    "eslint-config-prettier": "^9.1.0",
+    "prettier": "^3.3.3",
+    "typescript": "^5.5.4"
+  }
+}
