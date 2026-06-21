@@ -1,20 +1,25 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { io } from 'socket.io-client';
 import {
+  Camera,
   Hash,
+  Image,
   Link2,
   LogOut,
   Menu,
   MessageCircle,
   Mic,
   Plus,
+  Search,
   Send,
   Settings,
   Shield,
+  Sticker,
+  Trash2,
   Users,
   Video,
 } from 'lucide-react';
-import { api, attachmentMessage, copyText, type UploadedFile } from './api';
+import { API_URL, api, attachmentMessage, copyText, type UploadedFile } from './api';
 import type { Channel, Message, Server, User } from './types';
 import { Login } from './components/Login';
 import { InitialChange } from './components/InitialChange';
@@ -25,8 +30,12 @@ import { useI18n } from './i18n';
 import { DirectMessages } from './components/DirectMessages';
 import { ProfileModal } from './components/ProfileModal';
 import { UserAvatar } from './components/UserAvatar';
-import { MessageContent } from './components/MessageContent';
 import { CreateServer } from './components/CreateServer';
+import { MessageRow } from './components/MessageRow';
+import { ForwardDialog } from './components/ForwardDialog';
+import { MediaPicker } from './components/MediaPicker';
+import { RegisterInvite } from './components/RegisterInvite';
+import { SearchPanel } from './components/SearchPanel';
 
 const socket = io(import.meta.env.VITE_SOCKET_URL || window.location.origin, {
   autoConnect: false,
@@ -45,9 +54,14 @@ export function App() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [showMembers, setShowMembers] = useState(true);
   const [error, setError] = useState('');
-  const [profile, setProfile] = useState<Pick<User, 'id' | 'username' | 'createdAt' | 'avatarUrl' | 'status'> | null>(null);
+  const [profile, setProfile] = useState<User | null>(null);
   const [dmTarget, setDmTarget] = useState('');
   const [notice, setNotice] = useState('');
+  const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  const [forwardingMessage, setForwardingMessage] = useState<Message | null>(null);
+  const [mediaPicker, setMediaPicker] = useState<'gifs' | 'stickers' | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const registrationToken = new URLSearchParams(window.location.search).get('register');
 
   const server = servers.find((item) => item.id === serverId);
   const channel = server?.channels.find((item) => item.id === channelId);
@@ -160,19 +174,29 @@ export function App() {
       );
     };
     const onServerMemberUpdate = () => loadServers().catch((err) => setError(err.message));
+    const onServerUpdate = ({ serverId: updatedServerId, imageUrl }: { serverId: string; imageUrl: string | null }) => {
+      setServers((current) =>
+        current.map((item) => item.id === updatedServerId ? { ...item, imageUrl } : item),
+      );
+    };
     socket.on('presence:update', onPresence);
     socket.on('user:update', onUserUpdate);
     socket.on('server:member:update', onServerMemberUpdate);
+    socket.on('server:update', onServerUpdate);
     return () => {
       socket.off('presence:update', onPresence);
       socket.off('user:update', onUserUpdate);
       socket.off('server:member:update', onServerMemberUpdate);
+      socket.off('server:update', onServerUpdate);
     };
   }, [loadServers]);
 
   useEffect(() => {
     if (!channelId || channel?.type !== 'TEXT') {
       setMessages([]);
+      setReplyingTo(null);
+      setMediaPicker(null);
+      setSearchOpen(false);
       return;
     }
     api<{ messages: Message[] }>(`/channels/${channelId}/messages`)
@@ -191,6 +215,10 @@ export function App() {
       socket.off('message:new', onMessage);
     };
   }, [channelId, channel?.type]);
+
+  useEffect(() => {
+    if (serverId) socket.emit('server:join', serverId);
+  }, [serverId]);
 
   const logout = async () => {
     try {
@@ -245,12 +273,37 @@ export function App() {
     setChannelId(channel.id);
   };
 
-  const showProfile = async (username: string) => {
+  const uploadServerImage = async (file: File) => {
+    if (!server) return;
+    const form = new FormData();
+    form.append('file', file);
     try {
-      const result = await api<{ user: Pick<User, 'id' | 'username' | 'createdAt' | 'avatarUrl' | 'status'> }>(
+      const result = await api<{ imageUrl: string }>(`/servers/${server.id}/image`, {
+        method: 'POST',
+        body: form,
+      });
+      setServers((current) =>
+        current.map((item) => item.id === server.id ? { ...item, imageUrl: result.imageUrl } : item),
+      );
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const removeServerImage = async () => {
+    if (!server) return;
+    await api(`/servers/${server.id}/image`, { method: 'DELETE' });
+    setServers((current) =>
+      current.map((item) => item.id === server.id ? { ...item, imageUrl: null } : item),
+    );
+  };
+
+  const showProfile = async (username: string, serverJoinedAt?: string) => {
+    try {
+      const result = await api<{ user: User }>(
         `/users/${encodeURIComponent(username)}/profile`,
       );
-      setProfile(result.user);
+      setProfile({ ...result.user, serverJoinedAt });
     } catch (err) {
       setError((err as Error).message);
     }
@@ -264,12 +317,22 @@ export function App() {
     try {
       await api(`/channels/${channel.id}/messages`, {
         method: 'POST',
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({ content, replyToId: replyingTo?.id }),
       });
+      setReplyingTo(null);
     } catch (err) {
       setError((err as Error).message);
       setText(content);
     }
+  };
+
+  const sendRichContent = async (content: string) => {
+    if (!channel) return;
+    await api(`/channels/${channel.id}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ content, replyToId: replyingTo?.id }),
+    });
+    setReplyingTo(null);
   };
 
   const upload = async (file: File) => {
@@ -295,6 +358,9 @@ export function App() {
     [server?.name],
   );
 
+  if (registrationToken && !user) {
+    return <RegisterInvite token={registrationToken} onRegistered={setUser} />;
+  }
   if (user === undefined) return <div className="center-screen">A carregar WebCord…</div>;
   if (!user) return <Login onLogin={setUser} />;
   if (user.mustChangePassword) return <InitialChange onChanged={setUser} />;
@@ -329,7 +395,9 @@ export function App() {
               setChannelId(item.channels[0]?.id || '');
             }}
           >
-            {item.name.slice(0, 2).toUpperCase()}
+            {item.imageUrl
+              ? <img className="server-icon-image" src={`${API_URL}${item.imageUrl}`} alt={item.name} />
+              : item.name.slice(0, 2).toUpperCase()}
           </button>
         ))}
         <button className="server-icon add" onClick={() => setView('create-server')} title="Criar servidor">
@@ -339,13 +407,23 @@ export function App() {
 
       <aside className={`channel-panel ${mobileOpen ? 'mobile-open' : ''}`}>
         <header>
-          <div className="server-avatar">{initials}</div>
+          <div className={`server-avatar ${server?.imageUrl ? 'has-image' : ''}`}>
+            {server?.imageUrl
+              ? <img src={`${API_URL}${server.imageUrl}`} alt={server.name} />
+              : initials}
+          </div>
           <div>
             <strong>{server?.name || 'WebCord'}</strong>
             <small>{server?.description || t('communitySpace')}</small>
           </div>
           {server && <button className="server-invite-button" onClick={copyServerInvite} title="Copiar link de convite"><Link2 size={17} /></button>}
         </header>
+        {server && canCreateChannels && (
+          <div className="server-image-actions">
+            <label title="Alterar imagem do servidor"><Camera size={15} /> Imagem<input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" onChange={(event) => event.target.files?.[0] && uploadServerImage(event.target.files[0])} /></label>
+            {server.imageUrl && <button title="Remover imagem do servidor" onClick={removeServerImage}><Trash2 size={15} /></button>}
+          </div>
+        )}
         <div className="section-title">
           <span>{t('channels')}</span>
           {server && canCreateChannels && (
@@ -387,6 +465,7 @@ export function App() {
           <strong>{channel?.name || 'Bem-vindo'}</strong>
           <span>{channel?.type === 'TEXT' ? t('communityChat') : t('callRoom')}</span>
           <button className="members-toggle push-right" onClick={() => setShowMembers((current) => !current)} title="Membros"><Users /></button>
+          {channel?.type === 'TEXT' && <button className="members-toggle" onClick={() => setSearchOpen((current) => !current)} title="Pesquisar"><Search /></button>}
         </header>
 
         {!server ? (
@@ -413,31 +492,47 @@ export function App() {
                 <p>{t('welcomeChannel')}</p>
               </div>
               {messages.map((message) => (
-                <article className="message" key={message.id}>
-                  <UserAvatar user={message.author} />
-                  <div>
-                    <button className="username-button" onClick={() => showProfile(message.author.username)}><strong>{message.author.username}</strong></button>
-                    <time>{new Date(message.createdAt).toLocaleString('pt-PT')}</time>
-                    <MessageContent content={message.content} />
-                  </div>
-                </article>
+                <MessageRow
+                  key={message.id}
+                  message={message}
+                  onReply={setReplyingTo}
+                  onForward={setForwardingMessage}
+                  onProfile={(author) => showProfile(author.username)}
+                />
               ))}
             </section>
-            <form className="composer" onSubmit={send}>
-              <label className="attach" title="Enviar ficheiro">
-                <Plus />
-                <input type="file" onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])} />
-              </label>
-              <input
-                value={text}
-                onChange={(event) => {
-                  setText(event.target.value);
-                  socket.emit('typing', channelId);
-                }}
-                placeholder={`${t('messageTo')} #${channel.name}`}
-              />
-              <button type="submit"><Send size={20} /></button>
-            </form>
+            <div className="composer-area">
+              {mediaPicker && (
+                <MediaPicker
+                  initialTab={mediaPicker}
+                  onClose={() => setMediaPicker(null)}
+                  onSend={sendRichContent}
+                />
+              )}
+              {replyingTo && (
+                <div className="replying-banner">
+                  <span>A responder a <strong>@{replyingTo.author.username}</strong></span>
+                  <button onClick={() => setReplyingTo(null)}>×</button>
+                </div>
+              )}
+              <form className="composer" onSubmit={send}>
+                <label className="attach" title="Enviar ficheiro">
+                  <Plus />
+                  <input type="file" onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])} />
+                </label>
+                <input
+                  value={text}
+                  onChange={(event) => {
+                    setText(event.target.value);
+                    socket.emit('typing', channelId);
+                  }}
+                  placeholder={`${t('messageTo')} #${channel.name}`}
+                />
+                <button type="button" onClick={() => setMediaPicker(mediaPicker === 'gifs' ? null : 'gifs')} title="Enviar GIF"><Image size={19} /></button>
+                <button type="button" onClick={() => setMediaPicker(mediaPicker === 'stickers' ? null : 'stickers')} title="Enviar figurinha"><Sticker size={19} /></button>
+                <button type="submit"><Send size={20} /></button>
+              </form>
+            </div>
           </>
         )}
         {error && <button className="toast" onClick={() => setError('')}>{error}</button>}
@@ -451,7 +546,7 @@ export function App() {
               .slice()
               .sort((a, b) => Number(b.user.status === 'online') - Number(a.user.status === 'online'))
               .map((member) => (
-                <button key={member.id} onClick={() => showProfile(member.user.username)}>
+                <button key={member.id} onClick={() => showProfile(member.user.username, member.joinedAt)}>
                   <UserAvatar user={member.user} />
                   <span>
                     <strong>@{member.user.username}</strong>
@@ -462,11 +557,35 @@ export function App() {
           </div>
         </aside>
       )}
+      {searchOpen && channel?.type === 'TEXT' && (
+        <SearchPanel
+          endpoint={`/channels/${channel.id}/search`}
+          onClose={() => setSearchOpen(false)}
+          onReply={(message) => { setReplyingTo(message); setSearchOpen(false); }}
+          onForward={setForwardingMessage}
+        />
+      )}
       {profile && (
         <ProfileModal
           user={profile}
           onClose={() => setProfile(null)}
           onMessage={profile.id !== user.id ? () => { setDmTarget(profile.username); setProfile(null); setView('dms'); } : undefined}
+          onAddFriend={profile.id !== user.id ? async () => {
+            await api('/friends', {
+              method: 'POST',
+              body: JSON.stringify({ username: profile.username }),
+            });
+            setProfile((current) => current ? { ...current, relationship: 'pending' } : current);
+            setNotice('Pedido de amizade enviado');
+          } : undefined}
+        />
+      )}
+      {forwardingMessage && (
+        <ForwardDialog
+          message={forwardingMessage}
+          sourceType="channel"
+          onClose={() => setForwardingMessage(null)}
+          onForwarded={() => setNotice('Mensagem reencaminhada')}
         />
       )}
     </div>

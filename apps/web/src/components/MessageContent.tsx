@@ -8,6 +8,20 @@ type Attachment = {
   url: string;
 };
 
+function parseRichMedia(content: string) {
+  const match = content.match(
+    /^\[(giphy|sticker) id="([^"]+)" (?:title|name)="([^"]*)"\]\n(https?:\/\/[^\s]+)$/,
+  );
+  if (!match) return null;
+  const [, kind, id, encodedLabel, url] = match;
+  if (!kind || !id || !encodedLabel || !url) return null;
+  try {
+    return { kind, id, label: decodeURIComponent(encodedLabel), url };
+  } catch {
+    return null;
+  }
+}
+
 function giphyEmbedUrl(url: string) {
   try {
     const parsed = new URL(url);
@@ -158,6 +172,20 @@ function RemoteAttachmentPreview({ url }: { url: string }) {
 }
 
 export function MessageContent({ content }: { content: string }) {
+  const richMedia = parseRichMedia(content);
+  if (richMedia) {
+    return (
+      <a
+        href={richMedia.url}
+        target="_blank"
+        rel="noreferrer"
+        className={richMedia.kind === 'sticker' ? 'sticker-message' : 'gif-embed'}
+      >
+        <img src={richMedia.url} alt={richMedia.label} loading="lazy" />
+        {richMedia.kind === 'giphy' && <small>Powered by GIPHY</small>}
+      </a>
+    );
+  }
   const attachment = parseAttachment(content);
   if (attachment) return <AttachmentCard file={attachment} />;
 

@@ -1,15 +1,20 @@
 import { useEffect, useState } from 'react';
 import {
   ArrowLeft,
+  Ban,
   Check,
   Link2,
+  Image,
   MessageCircle,
   Mic,
   Plus,
   Search,
   Send,
+  Search as SearchIcon,
+  Sticker,
   UserMinus,
   UserPlus,
+  UserX,
   Users,
   Video,
   X,
@@ -25,9 +30,12 @@ import type {
 import { CallRoom } from './CallRoom';
 import { ProfileModal } from './ProfileModal';
 import { UserAvatar } from './UserAvatar';
-import { MessageContent } from './MessageContent';
+import { MessageRow } from './MessageRow';
+import { ForwardDialog } from './ForwardDialog';
+import { MediaPicker } from './MediaPicker';
+import { SearchPanel } from './SearchPanel';
 
-const emptyFriends: FriendsPayload = { friends: [], incoming: [], outgoing: [] };
+const emptyFriends: FriendsPayload = { friends: [], incoming: [], outgoing: [], blocked: [] };
 
 function ConversationAvatar({ conversation }: { conversation: DirectConversation }) {
   if (!conversation.isGroup && conversation.otherUser) {
@@ -63,6 +71,10 @@ export function DirectMessages({
   const [memberUsername, setMemberUsername] = useState('');
   const [notice, setNotice] = useState('');
   const [acceptingFriendId, setAcceptingFriendId] = useState('');
+  const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  const [forwardingMessage, setForwardingMessage] = useState<Message | null>(null);
+  const [mediaPicker, setMediaPicker] = useState<'gifs' | 'stickers' | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
   const selected = conversations.find((item) => item.id === selectedId);
 
   const loadConversations = async () => {
@@ -94,6 +106,15 @@ export function DirectMessages({
     setDialog(null);
   };
 
+  const openProfile = async (username: string) => {
+    try {
+      const result = await api<{ user: User }>(`/users/${encodeURIComponent(username)}/profile`);
+      setProfile(result.user);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   useEffect(() => {
     reload().catch((err) => setError(err.message));
   }, []);
@@ -110,6 +131,9 @@ export function DirectMessages({
   useEffect(() => {
     if (!selectedId) return;
     setCallMode(null);
+    setReplyingTo(null);
+    setMediaPicker(null);
+    setSearchOpen(false);
     api<{ messages: Message[] }>(`/direct-conversations/${selectedId}/messages`)
       .then((result) => setMessages(result.messages))
       .catch((err) => setError(err.message));
@@ -165,6 +189,9 @@ export function DirectMessages({
             ? { ...request, user: { ...request.user, status } }
             : request,
         ),
+        blocked: current.blocked.map((blocked) =>
+          blocked.id === userId ? { ...blocked, status } : blocked,
+        ),
       }));
     };
     const refreshFriends = () => loadFriends().catch((err) => setError(err.message));
@@ -217,6 +244,7 @@ export function DirectMessages({
         ],
         incoming: current.incoming.filter((request) => request.id !== id),
         outgoing: current.outgoing,
+        blocked: current.blocked,
       }));
       setNotice(`@${result.friend.username} foi adicionado aos amigos`);
     } catch (err) {
@@ -234,6 +262,17 @@ export function DirectMessages({
 
   const removeFriend = async (userId: string) => {
     await api(`/friends/user/${userId}`, { method: 'DELETE' });
+    await loadFriends();
+  };
+
+  const blockUser = async (userId: string) => {
+    await api(`/blocks/${userId}`, { method: 'POST' });
+    await reload();
+    setNotice('Utilizador bloqueado');
+  };
+
+  const unblockUser = async (userId: string) => {
+    await api(`/blocks/${userId}`, { method: 'DELETE' });
     await loadFriends();
   };
 
@@ -297,12 +336,22 @@ export function DirectMessages({
     try {
       await api(`/direct-conversations/${selectedId}/messages`, {
         method: 'POST',
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({ content, replyToId: replyingTo?.id }),
       });
+      setReplyingTo(null);
     } catch (err) {
       setText(content);
       setError((err as Error).message);
     }
+  };
+
+  const sendRichContent = async (content: string) => {
+    if (!selectedId) return;
+    await api(`/direct-conversations/${selectedId}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ content, replyToId: replyingTo?.id }),
+    });
+    setReplyingTo(null);
   };
 
   const upload = async (file: File) => {
@@ -415,12 +464,21 @@ export function DirectMessages({
             <h3>Amigos</h3>
             {friends.friends.map((friend) => (
               <div className="friend-row" key={friend.id}>
-                <button className="friend-profile" onClick={() => setProfile(friend)}>
+                <button className="friend-profile" onClick={() => openProfile(friend.username)}>
                   <UserAvatar user={friend} />
                   <span><strong>@{friend.username}</strong><small>{friend.status === 'online' ? 'Online' : 'Offline'}</small></span>
                 </button>
                 <button onClick={() => openUsername(friend.username)} title="Mensagem"><MessageCircle /></button>
                 <button onClick={() => removeFriend(friend.id)} title="Remover amigo"><UserMinus /></button>
+                <button onClick={() => blockUser(friend.id)} title="Bloquear"><Ban /></button>
+              </div>
+            ))}
+            {friends.blocked.length > 0 && <h3>Bloqueados</h3>}
+            {friends.blocked.map((blocked) => (
+              <div className="friend-row" key={blocked.id}>
+                <UserAvatar user={blocked} />
+                <strong>@{blocked.username}</strong>
+                <button onClick={() => unblockUser(blocked.id)} title="Desbloquear"><UserX /></button>
               </div>
             ))}
           </div>
@@ -433,7 +491,7 @@ export function DirectMessages({
             <header className="chat-header">
               <button
                 className="profile-name"
-                onClick={() => selected.otherUser && setProfile(selected.otherUser as User)}
+                onClick={() => selected.otherUser && openProfile(selected.otherUser.username)}
               >
                 <ConversationAvatar conversation={selected} />
                 <strong>{title}</strong>
@@ -441,6 +499,7 @@ export function DirectMessages({
               {selected.isGroup && <span>{selected.members.length}/10 membros</span>}
               <button className="push-right call-action" onClick={() => setCallMode('audio')} title="Chamada de voz"><Mic /></button>
               <button className="call-action" onClick={() => setCallMode('video')} title="Chamada de vídeo"><Video /></button>
+              <button className="call-action" onClick={() => setSearchOpen((current) => !current)} title="Pesquisar"><SearchIcon /></button>
               {selected.isGroup && <button className="call-action" onClick={() => setDialog('members')} title="Membros"><Users /></button>}
             </header>
             {callMode ? (
@@ -458,17 +517,37 @@ export function DirectMessages({
                     <p>{selected.isGroup ? `Grupo privado com ${selected.members.length} membros.` : 'Esta é uma conversa privada entre amigos.'}</p>
                   </div>
                   {messages.map((message) => (
-                    <article className="message" key={message.id}>
-                      <UserAvatar user={message.author} />
-                      <div><strong>@{message.author.username}</strong><time>{new Date(message.createdAt).toLocaleString()}</time><MessageContent content={message.content} /></div>
-                    </article>
+                    <MessageRow
+                      key={message.id}
+                      message={message}
+                      onReply={setReplyingTo}
+                      onForward={setForwardingMessage}
+                      onProfile={(author) => openProfile(author.username)}
+                    />
                   ))}
                 </section>
-                <form className="composer" onSubmit={send}>
-                  <label className="attach" title="Enviar anexo"><Plus /><input type="file" onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])} /></label>
-                  <input value={text} onChange={(event) => setText(event.target.value)} placeholder={`Mensagem para ${title}`} />
-                  <button><Send size={20} /></button>
-                </form>
+                <div className="composer-area">
+                  {mediaPicker && (
+                    <MediaPicker
+                      initialTab={mediaPicker}
+                      onClose={() => setMediaPicker(null)}
+                      onSend={sendRichContent}
+                    />
+                  )}
+                  {replyingTo && (
+                    <div className="replying-banner">
+                      <span>A responder a <strong>@{replyingTo.author.username}</strong></span>
+                      <button onClick={() => setReplyingTo(null)}>×</button>
+                    </div>
+                  )}
+                  <form className="composer" onSubmit={send}>
+                    <label className="attach" title="Enviar anexo"><Plus /><input type="file" onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])} /></label>
+                    <input value={text} onChange={(event) => setText(event.target.value)} placeholder={`Mensagem para ${title}`} />
+                    <button type="button" onClick={() => setMediaPicker(mediaPicker === 'gifs' ? null : 'gifs')} title="Enviar GIF"><Image size={19} /></button>
+                    <button type="button" onClick={() => setMediaPicker(mediaPicker === 'stickers' ? null : 'stickers')} title="Enviar figurinha"><Sticker size={19} /></button>
+                    <button><Send size={20} /></button>
+                  </form>
+                </div>
               </>
             )}
           </>
@@ -548,7 +627,40 @@ export function DirectMessages({
         </div>
       )}
 
-      {profile && <ProfileModal user={profile} onClose={() => setProfile(null)} />}
+      {profile && (
+        <ProfileModal
+          user={profile}
+          onClose={() => setProfile(null)}
+          onMessage={profile.relationship === 'friend' ? () => {
+            openUsername(profile.username).catch((err) => setError(err.message));
+            setProfile(null);
+          } : undefined}
+          onAddFriend={profile.relationship === 'none' ? async () => {
+            await api('/friends', {
+              method: 'POST',
+              body: JSON.stringify({ username: profile.username }),
+            });
+            setProfile((current) => current ? { ...current, relationship: 'pending' } : current);
+            await loadFriends();
+          } : undefined}
+        />
+      )}
+      {searchOpen && selected && (
+        <SearchPanel
+          endpoint={`/direct-conversations/${selected.id}/search`}
+          onClose={() => setSearchOpen(false)}
+          onReply={(message) => { setReplyingTo(message); setSearchOpen(false); }}
+          onForward={setForwardingMessage}
+        />
+      )}
+      {forwardingMessage && (
+        <ForwardDialog
+          message={forwardingMessage}
+          sourceType="direct"
+          onClose={() => setForwardingMessage(null)}
+          onForwarded={() => setNotice('Mensagem reencaminhada')}
+        />
+      )}
     </div>
   );
 }

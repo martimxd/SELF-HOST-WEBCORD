@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   directGroupSchema,
+  forwardMessageSchema,
+  giphySearchSchema,
   initialChangeSchema,
   passwordSchema,
   qualityProfiles,
+  registrationInviteSchema,
+  updateProfileSchema,
   updateUsernameSchema,
 } from '@webcord/shared';
 import { requireSuperAdmin } from './permissions.js';
@@ -50,6 +54,33 @@ describe('security contracts', () => {
   it('validates username changes with the public username rules', () => {
     expect(updateUsernameSchema.safeParse({ username: 'novo.user-2' }).success).toBe(true);
     expect(updateUsernameSchema.safeParse({ username: 'nome com espaços' }).success).toBe(false);
+  });
+
+  it('validates profile limits', () => {
+    expect(updateProfileSchema.safeParse({ bio: 'A'.repeat(400), customStatus: 'A trabalhar' }).success).toBe(true);
+    expect(updateProfileSchema.safeParse({ bio: 'A'.repeat(401) }).success).toBe(false);
+  });
+
+  it('validates forwarding destinations', () => {
+    expect(forwardMessageSchema.safeParse({
+      sourceType: 'channel',
+      sourceMessageId: 'message-1',
+      targetType: 'direct',
+      targetId: 'conversation-1',
+    }).success).toBe(true);
+    expect(forwardMessageSchema.safeParse({
+      sourceType: 'invalid',
+      sourceMessageId: '',
+      targetType: 'direct',
+      targetId: '',
+    }).success).toBe(false);
+  });
+
+  it('limits GIPHY searches and registration invite durations', () => {
+    expect(giphySearchSchema.safeParse({ q: 'reaction', offset: '24' }).success).toBe(true);
+    expect(giphySearchSchema.safeParse({ q: 'x'.repeat(51), offset: 500 }).success).toBe(false);
+    expect(registrationInviteSchema.safeParse({ expiresIn: '7d' }).success).toBe(true);
+    expect(registrationInviteSchema.safeParse({ expiresIn: '30d' }).success).toBe(false);
   });
 
   it('blocks user administration for non-super-admin accounts', async () => {

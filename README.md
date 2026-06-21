@@ -10,15 +10,24 @@ Open source project distributed under the MIT license.
 - Text, voice, and video channels.
 - Real-time messages with Socket.IO.
 - Friend requests, friend invite links, and DMs.
+- Friend removal and account blocking.
 - Private groups with up to 10 members.
 - Online, offline, and invisible presence.
 - Profile pictures and username changes.
+- Bios, custom statuses, server join dates, and relationship-aware profile actions.
 - Server invite links.
+- Server image customization for moderators and administrators.
 - Persistent uploads with random CDN URLs.
 - Image, video, and audio previews.
+- Replies and message forwarding across channels and DMs.
+- GIPHY search with configurable content rating.
+- Personal PNG, WEBP, and GIF stickers.
+- Categorized search for messages, images, videos, files, and links.
+- Single-use registration links created only by the super-admin, with optional expiration.
 - Cards for documents, files, APKs, and EXEs.
 - LiveKit calls with screen sharing.
 - Account administration and upload limits.
+- Deleted accounts are anonymized as `Deleted User` while preserving conversation history.
 - Interface in Portuguese, English, and French.
 
 ## Installation privacy
@@ -137,11 +146,18 @@ Main `.env` variables:
 | `WEB_PORT` | Local site port, usually `3000` |
 | `LIVEKIT_API_KEY` | Internal LiveKit identifier |
 | `LIVEKIT_API_SECRET` | LiveKit secret key |
+| `GIPHY_API_KEY` | Optional GIPHY API key used by the GIF picker |
+| `GIPHY_RATING` | Maximum GIPHY content rating, such as `pg-13` |
+| `GIPHY_COUNTRY_CODE` | Two-letter country code sent to GIPHY |
 | `VITE_API_URL` | Should normally remain `/api` |
 | `VITE_SOCKET_URL` | Empty uses the same domain as the site |
 | `VITE_LIVEKIT_URL` | Empty uses `ws(s)://domain/livekit` |
 
 Never publish `.env`.
+
+To enable GIF search, create an API key in the
+[GIPHY Developer Dashboard](https://developers.giphy.com/) and set
+`GIPHY_API_KEY` in `.env`. Personal stickers do not require GIPHY.
 
 ## Access methods
 
@@ -347,4 +363,4 @@ MIT. You can use, modify, and host your own instance.
 
 ## Author
 
-Created by [Martim](https://www.youtube.com/@martimxd).
+Created by [Martim](https://www.youtube.com/@MartimTech-s5b).

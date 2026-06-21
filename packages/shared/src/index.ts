@@ -39,6 +39,10 @@ export const createUserSchema = z.object({
   isSuperAdmin: z.boolean().default(false),
 });
 
+export const registrationInviteSchema = z.object({
+  expiresIn: z.enum(['1h', '3d', '7d', 'never']),
+});
+
 export const serverSchema = z.object({
   name: z.string().trim().min(2).max(80),
   description: z.string().trim().max(500).default(''),
@@ -54,6 +58,18 @@ export const messageSchema = z.object({
   replyToId: z.string().optional(),
 });
 
+export const forwardMessageSchema = z.object({
+  sourceType: z.enum(['channel', 'direct']),
+  sourceMessageId: z.string().min(1),
+  targetType: z.enum(['channel', 'direct']),
+  targetId: z.string().min(1),
+});
+
+export const giphySearchSchema = z.object({
+  q: z.string().trim().max(50).default(''),
+  offset: z.coerce.number().int().min(0).max(499).default(0),
+});
+
 export const directConversationSchema = z.object({
   username: usernameSchema,
 });
@@ -64,6 +80,14 @@ export const friendRequestSchema = z.object({
 
 export const updateUsernameSchema = z.object({
   username: usernameSchema,
+});
+
+export const updateProfileSchema = z.object({
+  username: usernameSchema.optional(),
+  bio: z.string().trim().max(400).optional(),
+  customStatus: z.string().trim().max(80).optional(),
+}).refine((value) => Object.keys(value).length > 0, {
+  message: 'Indique pelo menos uma alteração',
 });
 
 export const directGroupSchema = z.object({
