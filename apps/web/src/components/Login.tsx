@@ -48,7 +48,7 @@ export function Login({ onLogin }: { onLogin: (user: User) => void }) {
         <button className="primary" disabled={loading}>{loading ? t('loggingIn') : t('login')}</button>
         <div className="login-credit">
           <small><Info size={13} /> {t('firstInstall')}</small>
-          <a href="https://www.youtube.com/@martimxd" target="_blank" rel="noreferrer">
+          <a href="https://www.youtube.com/@MartimTech-s5b" target="_blank" rel="noreferrer">
             {t('projectCredit')}
           </a>
         </div>

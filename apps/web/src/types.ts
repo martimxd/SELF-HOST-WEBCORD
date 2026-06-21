@@ -8,6 +8,10 @@ export type User = {
   avatarUrl?: string | null;
   status?: 'online' | 'offline';
   presenceMode?: 'ONLINE' | 'INVISIBLE';
+  bio?: string;
+  customStatus?: string;
+  relationship?: 'self' | 'friend' | 'pending' | 'none' | 'blocked';
+  serverJoinedAt?: string;
 };
 
 export type Channel = {
@@ -20,8 +24,9 @@ export type Server = {
   id: string;
   name: string;
   description: string;
+  imageUrl?: string | null;
   channels: Channel[];
-  members: Array<{ id: string; role: string; user: User }>;
+  members: Array<{ id: string; role: string; joinedAt: string; user: User }>;
 };
 
 export type Message = {
@@ -30,6 +35,12 @@ export type Message = {
   content: string;
   createdAt: string;
   author: Pick<User, 'id' | 'username' | 'avatarUrl' | 'status'>;
+  forwardedFrom?: string | null;
+  replyTo?: {
+    id: string;
+    content: string;
+    author: Pick<User, 'id' | 'username' | 'avatarUrl'>;
+  } | null;
 };
 
 export type DirectConversation = {
@@ -52,4 +63,24 @@ export type FriendsPayload = {
   friends: User[];
   incoming: FriendRequest[];
   outgoing: FriendRequest[];
+  blocked: User[];
+};
+
+export type Sticker = {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  createdAt: string;
+  url: string;
+};
+
+export type GiphyGif = {
+  id: string;
+  title: string;
+  url: string;
+  previewUrl: string;
+  width: number;
+  height: number;
+  analyticsOnSend: string;
 };

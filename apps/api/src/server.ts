@@ -19,12 +19,15 @@ import {
   directConversationSchema,
   directGroupMemberSchema,
   directGroupSchema,
+  forwardMessageSchema,
   friendRequestSchema,
+  giphySearchSchema,
   initialChangeSchema,
   loginSchema,
   messageSchema,
+  registrationInviteSchema,
   serverSchema,
-  updateUsernameSchema,
+  updateProfileSchema,
 } from '@webcord/shared';
 import { config } from './config.js';
 import { prisma } from './db.js';
@@ -92,19 +95,28 @@ function publicUser(user: {
   createdAt?: Date;
   avatarStoredName?: string | null;
   presenceMode?: string;
+  bio?: string;
+  customStatus?: string;
 }) {
+  const deleted = user.username.startsWith('deleted-');
   return {
     id: user.id,
-    username: user.username,
+    username: deleted ? 'Deleted User' : user.username,
     isSuperAdmin: user.isSuperAdmin,
     mustChangePassword: user.mustChangePassword,
     suspended: user.suspended,
     createdAt: user.createdAt,
-    avatarUrl: user.avatarStoredName ? `/avatars/${user.avatarStoredName}` : null,
+    avatarUrl: !deleted && user.avatarStoredName ? `/avatars/${user.avatarStoredName}` : null,
     presenceMode: user.presenceMode ?? 'ONLINE',
+    bio: deleted ? '' : user.bio ?? '',
+    customStatus: deleted ? '' : user.customStatus ?? '',
     status:
       user.presenceMode === 'INVISIBLE' || !onlineUsers.has(user.id) ? 'offline' : 'online',
   };
+}
+
+function displayUsername(username: string) {
+  return username.startsWith('deleted-') ? 'Deleted User' : username;
 }
 
 async function isMember(userId: string, serverId: string) {
@@ -119,7 +131,7 @@ async function canManage(userId: string, serverId: string) {
 }
 
 async function getDirectConversation(userId: string, conversationId: string) {
-  return prisma.directConversation.findFirst({
+  const conversation = await prisma.directConversation.findFirst({
     where: {
       id: conversationId,
       members: { some: { userId } },
@@ -141,6 +153,10 @@ async function getDirectConversation(userId: string, conversationId: string) {
       },
     },
   });
+  if (!conversation || conversation.isGroup) return conversation;
+  const otherUser = conversation.members.find((member) => member.user.id !== userId);
+  if (otherUser && await isBlockedBetween(userId, otherUser.user.id)) return null;
+  return conversation;
 }
 
 function createCdnToken() {
@@ -203,6 +219,96 @@ async function areFriends(userId: string, otherUserId: string) {
       ],
     },
   });
+}
+
+async function isBlockedBetween(userId: string, otherUserId: string) {
+  return prisma.userBlock.findFirst({
+    where: {
+      OR: [
+        { blockerId: userId, blockedId: otherUserId },
+        { blockerId: otherUserId, blockedId: userId },
+      ],
+    },
+  });
+}
+
+function stickerResponse(sticker: {
+  id: string;
+  name: string;
+  publicToken: string;
+  mimeType: string;
+  size: bigint;
+  createdAt: Date;
+}) {
+  return {
+    id: sticker.id,
+    name: sticker.name,
+    mimeType: sticker.mimeType,
+    size: Number(sticker.size),
+    createdAt: sticker.createdAt,
+    url: `/api/stickers/content/${sticker.publicToken}`,
+  };
+}
+
+function serializeReply(reply: {
+  id: string;
+  content: string;
+  author: { id: string; username: string; avatarStoredName: string | null };
+} | null) {
+  if (!reply) return null;
+  return {
+    id: reply.id,
+    content: reply.content,
+    author: {
+      id: reply.author.id,
+      username: displayUsername(reply.author.username),
+      avatarUrl: reply.author.avatarStoredName
+        ? `/avatars/${reply.author.avatarStoredName}`
+        : null,
+    },
+  };
+}
+
+type GiphyItem = {
+  id?: string;
+  title?: string;
+  alt_text?: string;
+  images?: Record<string, { url?: string; width?: string; height?: string } | undefined>;
+  analytics?: { onsent?: { url?: string } };
+};
+
+function normalizeGiphyItem(item: GiphyItem) {
+  const rendition = item.images?.fixed_height ?? item.images?.downsized_medium ?? item.images?.original;
+  const preview = item.images?.fixed_height_small_still ?? item.images?.fixed_height_still;
+  if (!item.id || !rendition?.url) return null;
+  return {
+    id: item.id,
+    title: item.title || item.alt_text || 'GIF',
+    url: rendition.url,
+    previewUrl: preview?.url || rendition.url,
+    width: Number(rendition.width || 0),
+    height: Number(rendition.height || 0),
+    analyticsOnSend: item.analytics?.onsent?.url || '',
+  };
+}
+
+function contentCategory(content: string) {
+  const value = content.toLowerCase();
+  if (/\.(png|jpe?g|webp|gif|avif)(?:[?\s]|$)/.test(value) || value.startsWith('[sticker')) {
+    return 'images';
+  }
+  if (/\.(mp4|webm|mov)(?:[?\s]|$)/.test(value)) return 'videos';
+  if (value.startsWith('[attachment') || /\.(pdf|docx?|xlsx?|pptx?|txt|zip|rar|7z|apk|exe|msi)(?:[?\s]|$)/.test(value)) {
+    return 'files';
+  }
+  if (/https?:\/\//.test(value)) return 'links';
+  return 'messages';
+}
+
+function matchesSearchCategory(content: string, category: string) {
+  return category === 'messages'
+    ? contentCategory(content) === 'messages'
+    : contentCategory(content) === category;
 }
 
 app.get('/health', async () => {
@@ -290,6 +396,80 @@ app.post('/admin/users', { preHandler: [requireReady, requireSuperAdmin] }, asyn
   return reply.code(201).send({ user: publicUser(user) });
 });
 
+app.get('/admin/registration-invites', { preHandler: [requireReady, requireSuperAdmin] }, async () => {
+  const invites = await prisma.registrationInvite.findMany({
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+  });
+  return { invites };
+});
+
+app.post('/admin/registration-invites', { preHandler: [requireReady, requireSuperAdmin] }, async (request, reply) => {
+  const { expiresIn } = registrationInviteSchema.parse(request.body);
+  const durations: Record<string, number> = {
+    '1h': 60 * 60 * 1000,
+    '3d': 3 * 24 * 60 * 60 * 1000,
+    '7d': 7 * 24 * 60 * 60 * 1000,
+  };
+  const invite = await prisma.registrationInvite.create({
+    data: {
+      token: createInviteToken(),
+      creatorId: request.user!.id,
+      expiresAt: expiresIn === 'never' ? null : new Date(Date.now() + durations[expiresIn]!),
+    },
+  });
+  return reply.code(201).send({ invite });
+});
+
+app.delete('/admin/registration-invites/:id', { preHandler: [requireReady, requireSuperAdmin] }, async (request) => {
+  const { id } = request.params as { id: string };
+  await prisma.registrationInvite.deleteMany({ where: { id, creatorId: request.user!.id } });
+  return { ok: true };
+});
+
+app.get('/registration-invites/:token', async (request, reply) => {
+  const { token } = request.params as { token: string };
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
+    return reply.code(404).send({ error: 'Convite inválido' });
+  }
+  const invite = await prisma.registrationInvite.findUnique({ where: { token } });
+  if (!invite || invite.usedAt || (invite.expiresAt && invite.expiresAt <= new Date())) {
+    return reply.code(410).send({ error: 'Este convite expirou ou já foi utilizado' });
+  }
+  return { valid: true, expiresAt: invite.expiresAt };
+});
+
+app.post('/registration-invites/:token/register', async (request, reply) => {
+  const { token } = request.params as { token: string };
+  const input = createUserSchema.omit({ isSuperAdmin: true }).parse(request.body);
+  const invite = await prisma.registrationInvite.findUnique({ where: { token } });
+  if (!invite || invite.usedAt || (invite.expiresAt && invite.expiresAt <= new Date())) {
+    return reply.code(410).send({ error: 'Este convite expirou ou já foi utilizado' });
+  }
+  const user = await prisma.$transaction(async (transaction) => {
+    const claimed = await transaction.registrationInvite.updateMany({
+      where: {
+        id: invite.id,
+        usedAt: null,
+        OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+      },
+      data: { usedAt: new Date() },
+    });
+    if (claimed.count !== 1) return null;
+    return transaction.user.create({
+      data: {
+        username: input.username,
+        passwordHash: await argon2.hash(input.password),
+        isSuperAdmin: false,
+        mustChangePassword: false,
+      },
+    });
+  });
+  if (!user) return reply.code(410).send({ error: 'Este convite já foi utilizado' });
+  reply.setCookie('webcord_session', signSession(publicUser(user)), sessionCookieOptions(request));
+  return reply.code(201).send({ user: publicUser(user) });
+});
+
 app.patch('/admin/users/:id', { preHandler: [requireReady, requireSuperAdmin] }, async (request) => {
   const { id } = request.params as { id: string };
   const body = request.body as { suspended?: boolean; password?: string; username?: string };
@@ -307,7 +487,63 @@ app.patch('/admin/users/:id', { preHandler: [requireReady, requireSuperAdmin] },
 app.delete('/admin/users/:id', { preHandler: [requireReady, requireSuperAdmin] }, async (request, reply) => {
   const { id } = request.params as { id: string };
   if (id === request.user!.id) return reply.code(400).send({ error: 'Não pode apagar a própria conta' });
-  await prisma.user.delete({ where: { id } });
+  const target = await prisma.user.findUnique({ where: { id } });
+  if (!target) return reply.code(404).send({ error: 'Utilizador não encontrado' });
+  const ownedServers = await prisma.server.findMany({
+    where: { ownerId: id },
+    select: { id: true, members: { where: { userId: { not: id } }, take: 1 } },
+  });
+  if (ownedServers.some((server) => server.members.length === 0)) {
+    return reply.code(409).send({
+      error: 'Transfira ou elimine os servidores em que este utilizador é o único membro',
+    });
+  }
+  await prisma.$transaction(async (transaction) => {
+    for (const server of ownedServers) {
+      const successor = server.members[0];
+      if (!successor) continue;
+      await transaction.server.update({
+        where: { id: server.id },
+        data: { ownerId: successor.userId },
+      });
+      await transaction.serverMember.update({
+        where: { userId_serverId: { userId: successor.userId, serverId: server.id } },
+        data: { role: 'OWNER' },
+      });
+    }
+    await transaction.user.update({
+      where: { id },
+      data: {
+        username: `deleted-${id}`,
+        passwordHash: await argon2.hash(randomBytes(32).toString('hex')),
+        avatarStoredName: null,
+        bio: '',
+        customStatus: '',
+        presenceMode: 'INVISIBLE',
+        suspended: true,
+        isSuperAdmin: false,
+        deletedAt: new Date(),
+      },
+    });
+    await transaction.friendship.deleteMany({
+      where: { OR: [{ requesterId: id }, { addresseeId: id }] },
+    });
+    await transaction.userBlock.deleteMany({
+      where: { OR: [{ blockerId: id }, { blockedId: id }] },
+    });
+    await transaction.friendInvite.deleteMany({ where: { ownerId: id } });
+  });
+  if (target.avatarStoredName) {
+    fs.rmSync(path.join(config.UPLOAD_DIR, 'avatars', target.avatarStoredName), { force: true });
+  }
+  io.emit('user:update', {
+    id,
+    username: 'Deleted User',
+    avatarUrl: null,
+    bio: '',
+    customStatus: '',
+    status: 'offline',
+  });
   return { ok: true };
 });
 
@@ -349,10 +585,48 @@ app.get('/users/:username/profile', { preHandler: requireReady }, async (request
   const { username } = request.params as { username: string };
   const user = await prisma.user.findUnique({
     where: { username },
-    select: { id: true, username: true, createdAt: true, avatarStoredName: true, presenceMode: true },
+    select: {
+      id: true,
+      username: true,
+      createdAt: true,
+      avatarStoredName: true,
+      presenceMode: true,
+      bio: true,
+      customStatus: true,
+    },
   });
   if (!user) return reply.code(404).send({ error: 'Utilizador não encontrado' });
-  return { user: publicUser({ ...user, isSuperAdmin: false, mustChangePassword: false, suspended: false }) };
+  let relationship: 'self' | 'friend' | 'pending' | 'none' | 'blocked' = 'none';
+  if (user.id === request.user!.id) {
+    relationship = 'self';
+  } else if (await isBlockedBetween(request.user!.id, user.id)) {
+    relationship = 'blocked';
+  } else {
+    const friendship = await prisma.friendship.findFirst({
+      where: {
+        OR: [
+          { requesterId: request.user!.id, addresseeId: user.id },
+          { requesterId: user.id, addresseeId: request.user!.id },
+        ],
+      },
+    });
+    relationship = friendship?.status === 'ACCEPTED'
+      ? 'friend'
+      : friendship
+        ? 'pending'
+        : 'none';
+  }
+  return {
+    user: {
+      ...publicUser({
+        ...user,
+        isSuperAdmin: false,
+        mustChangePassword: false,
+        suspended: false,
+      }),
+      relationship,
+    },
+  };
 });
 
 app.post('/users/me/avatar', { preHandler: requireReady }, async (request, reply) => {
@@ -402,10 +676,10 @@ app.delete('/users/me/avatar', { preHandler: requireReady }, async (request) => 
 });
 
 app.patch('/users/me', { preHandler: requireReady }, async (request, reply) => {
-  const input = updateUsernameSchema.parse(request.body);
+  const input = updateProfileSchema.parse(request.body);
   const user = await prisma.user.update({
     where: { id: request.user!.id },
-    data: { username: input.username },
+    data: input,
   });
   reply.setCookie('webcord_session', signSession(publicUser(user)), sessionCookieOptions(request));
   io.emit('user:update', publicUser(user));
@@ -448,9 +722,29 @@ app.get('/avatars/:storedName', async (request, reply) => {
   return reply.send(fs.createReadStream(filePath));
 });
 
+app.get('/server-images/:storedName', async (request, reply) => {
+  const { storedName } = request.params as { storedName: string };
+  if (!/^[a-f0-9-]+\.(jpg|png|webp|gif|avif)$/.test(storedName)) {
+    return reply.code(404).send();
+  }
+  const filePath = path.join(config.UPLOAD_DIR, 'server-images', storedName);
+  if (!fs.existsSync(filePath)) return reply.code(404).send();
+  const extension = path.extname(storedName);
+  const contentTypes: Record<string, string> = {
+    '.jpg': 'image/jpeg',
+    '.png': 'image/png',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    '.avif': 'image/avif',
+  };
+  reply.header('Content-Type', contentTypes[extension] ?? 'application/octet-stream');
+  reply.header('Cache-Control', 'public, max-age=86400');
+  return reply.send(fs.createReadStream(filePath));
+});
+
 app.get('/friends', { preHandler: requireReady }, async (request) => {
   const userId = request.user!.id;
-  const [accepted, incoming, outgoing] = await Promise.all([
+  const [accepted, incoming, outgoing, blocked] = await Promise.all([
     prisma.friendship.findMany({
       where: {
         status: 'ACCEPTED',
@@ -469,6 +763,11 @@ app.get('/friends', { preHandler: requireReady }, async (request) => {
       include: { addressee: true },
       orderBy: { createdAt: 'desc' },
     }),
+    prisma.userBlock.findMany({
+      where: { blockerId: userId },
+      include: { blocked: true },
+      orderBy: { createdAt: 'desc' },
+    }),
   ]);
   return {
     friends: accepted.map((friendship) =>
@@ -482,7 +781,45 @@ app.get('/friends', { preHandler: requireReady }, async (request) => {
       id: friendship.id,
       user: publicUser(friendship.addressee),
     })),
+    blocked: blocked.map((entry) => publicUser(entry.blocked)),
   };
+});
+
+app.post('/blocks/:userId', { preHandler: requireReady }, async (request, reply) => {
+  const { userId } = request.params as { userId: string };
+  if (userId === request.user!.id) {
+    return reply.code(400).send({ error: 'Não pode bloquear a própria conta' });
+  }
+  const blockedUser = await prisma.user.findUnique({ where: { id: userId } });
+  if (!blockedUser) return reply.code(404).send({ error: 'Utilizador não encontrado' });
+  await prisma.$transaction([
+    prisma.userBlock.upsert({
+      where: {
+        blockerId_blockedId: { blockerId: request.user!.id, blockedId: userId },
+      },
+      create: { blockerId: request.user!.id, blockedId: userId },
+      update: {},
+    }),
+    prisma.friendship.deleteMany({
+      where: {
+        OR: [
+          { requesterId: request.user!.id, addresseeId: userId },
+          { requesterId: userId, addresseeId: request.user!.id },
+        ],
+      },
+    }),
+  ]);
+  io.to(`user:${userId}`).to(`user:${request.user!.id}`).emit('friend:update');
+  return { blocked: publicUser(blockedUser) };
+});
+
+app.delete('/blocks/:userId', { preHandler: requireReady }, async (request) => {
+  const { userId } = request.params as { userId: string };
+  await prisma.userBlock.deleteMany({
+    where: { blockerId: request.user!.id, blockedId: userId },
+  });
+  io.to(`user:${request.user!.id}`).emit('friend:update');
+  return { ok: true };
 });
 
 app.post('/friends/link', { preHandler: requireReady }, async (request) => {
@@ -509,6 +846,9 @@ app.post('/invites/friend/:token', { preHandler: requireReady }, async (request,
   }
   if (invite.ownerId === request.user!.id) {
     return reply.code(400).send({ error: 'Este link de amizade pertence à sua conta' });
+  }
+  if (await isBlockedBetween(request.user!.id, invite.ownerId)) {
+    return reply.code(403).send({ error: 'Não é possível adicionar este utilizador' });
   }
   const existing = await prisma.friendship.findFirst({
     where: {
@@ -544,6 +884,9 @@ app.post('/friends', { preHandler: requireReady }, async (request, reply) => {
   }
   if (addressee.id === request.user!.id) {
     return reply.code(400).send({ error: 'Não pode adicionar a própria conta' });
+  }
+  if (await isBlockedBetween(request.user!.id, addressee.id)) {
+    return reply.code(403).send({ error: 'Não é possível enviar um pedido a este utilizador' });
   }
   const existing = await prisma.friendship.findFirst({
     where: {
@@ -583,6 +926,9 @@ app.post('/friends/:id/accept', { preHandler: requireReady }, async (request, re
     include: { requester: true },
   });
   if (!friendship) return reply.code(404).send({ error: 'Pedido de amizade não encontrado' });
+  if (await isBlockedBetween(request.user!.id, friendship.requesterId)) {
+    return reply.code(403).send({ error: 'Não é possível aceitar este pedido' });
+  }
   if (friendship.status !== 'ACCEPTED') {
     await prisma.friendship.update({ where: { id }, data: { status: 'ACCEPTED' } });
   }
@@ -621,7 +967,8 @@ app.delete('/friends/user/:userId', { preHandler: requireReady }, async (request
 });
 
 app.get('/direct-conversations', { preHandler: requireReady }, async (request) => {
-  const conversations = await prisma.directConversation.findMany({
+  const [conversations, blocks] = await Promise.all([
+    prisma.directConversation.findMany({
     where: { members: { some: { userId: request.user!.id } } },
     include: {
       members: {
@@ -645,11 +992,26 @@ app.get('/direct-conversations', { preHandler: requireReady }, async (request) =
       },
     },
     orderBy: { updatedAt: 'desc' },
-  });
-  return {
-    conversations: conversations.map((conversation) =>
-      serializeDirectConversation(conversation, request.user!.id),
+    }),
+    prisma.userBlock.findMany({
+      where: {
+        OR: [{ blockerId: request.user!.id }, { blockedId: request.user!.id }],
+      },
+      select: { blockerId: true, blockedId: true },
+    }),
+  ]);
+  const blockedIds = new Set(
+    blocks.map((entry) =>
+      entry.blockerId === request.user!.id ? entry.blockedId : entry.blockerId,
     ),
+  );
+  return {
+    conversations: conversations
+      .filter((conversation) =>
+        conversation.isGroup
+        || !conversation.members.some((member) => blockedIds.has(member.user.id)),
+      )
+      .map((conversation) => serializeDirectConversation(conversation, request.user!.id)),
   };
 });
 
@@ -707,6 +1069,12 @@ app.post('/direct-groups', { preHandler: requireReady }, async (request, reply) 
   if (users.length !== usernames.length) {
     return reply.code(404).send({ error: 'Um ou mais usernames não existem' });
   }
+  const blockChecks = await Promise.all(
+    users.map((user) => isBlockedBetween(request.user!.id, user.id)),
+  );
+  if (blockChecks.some(Boolean)) {
+    return reply.code(403).send({ error: 'Um utilizador bloqueado não pode ser adicionado ao grupo' });
+  }
   const friendshipChecks = await Promise.all(
     users.map((user) => areFriends(request.user!.id, user.id)),
   );
@@ -763,6 +1131,9 @@ app.post('/direct-conversations/:id/members', { preHandler: requireReady }, asyn
   }
   if (conversation.members.some((member) => member.user.id === user.id)) {
     return reply.code(409).send({ error: 'Este utilizador já pertence ao grupo' });
+  }
+  if (await isBlockedBetween(request.user!.id, user.id)) {
+    return reply.code(403).send({ error: 'Este utilizador está bloqueado' });
   }
   if (!(await areFriends(request.user!.id, user.id))) {
     return reply.code(403).send({ error: 'Só pode adicionar amigos ao grupo' });
@@ -827,6 +1198,13 @@ app.get(
             presenceMode: true,
           },
         },
+        replyTo: {
+          include: {
+            author: {
+              select: { id: true, username: true, avatarStoredName: true },
+            },
+          },
+        },
       },
       orderBy: { createdAt: 'asc' },
       take: 100,
@@ -834,6 +1212,7 @@ app.get(
     return {
       messages: messages.map((message) => ({
         ...message,
+        replyTo: serializeReply(message.replyTo),
         author: publicUser({
           ...message.author,
           isSuperAdmin: false,
@@ -854,8 +1233,19 @@ app.post(
     if (!conversation) return reply.code(403).send({ error: 'Sem acesso a esta conversa' });
     const input = messageSchema.parse(request.body);
     const content = sanitizeHtml(input.content, { allowedTags: [], allowedAttributes: {} });
+    if (input.replyToId) {
+      const replyTarget = await prisma.directMessage.findFirst({
+        where: { id: input.replyToId, conversationId: id },
+      });
+      if (!replyTarget) return reply.code(400).send({ error: 'Mensagem original não encontrada' });
+    }
     const message = await prisma.directMessage.create({
-      data: { content, authorId: request.user!.id, conversationId: id },
+      data: {
+        content,
+        replyToId: input.replyToId,
+        authorId: request.user!.id,
+        conversationId: id,
+      },
       include: {
         author: {
           select: {
@@ -865,11 +1255,19 @@ app.post(
             presenceMode: true,
           },
         },
+        replyTo: {
+          include: {
+            author: {
+              select: { id: true, username: true, avatarStoredName: true },
+            },
+          },
+        },
       },
     });
     await prisma.directConversation.update({ where: { id }, data: { updatedAt: new Date() } });
     const responseMessage = {
       ...message,
+      replyTo: serializeReply(message.replyTo),
       author: publicUser({
         ...message.author,
         isSuperAdmin: false,
@@ -882,6 +1280,62 @@ app.post(
   },
 );
 
+app.get(
+  '/direct-conversations/:id/search',
+  { preHandler: requireReady },
+  async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { q = '', category = 'messages' } = request.query as {
+      q?: string;
+      category?: string;
+    };
+    if (!(await getDirectConversation(request.user!.id, id))) {
+      return reply.code(403).send({ error: 'Sem acesso a esta conversa' });
+    }
+    if (!['messages', 'images', 'videos', 'files', 'links'].includes(category)) {
+      return reply.code(400).send({ error: 'Categoria inválida' });
+    }
+    const messages = await prisma.directMessage.findMany({
+      where: {
+        conversationId: id,
+        ...(q.trim() ? { content: { contains: q.trim(), mode: 'insensitive' } } : {}),
+      },
+      include: {
+        author: {
+          select: {
+            id: true,
+            username: true,
+            avatarStoredName: true,
+            presenceMode: true,
+          },
+        },
+        replyTo: {
+          include: {
+            author: { select: { id: true, username: true, avatarStoredName: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 300,
+    });
+    return {
+      messages: messages
+        .filter((message) => matchesSearchCategory(message.content, category))
+        .slice(0, 100)
+        .map((message) => ({
+          ...message,
+          replyTo: serializeReply(message.replyTo),
+          author: publicUser({
+            ...message.author,
+            isSuperAdmin: false,
+            mustChangePassword: false,
+            suspended: false,
+          }),
+        })),
+    };
+  },
+);
+
 app.post(
   '/direct-conversations/:id/call-token',
   { preHandler: requireReady },
@@ -890,9 +1344,16 @@ app.post(
     if (!(await getDirectConversation(request.user!.id, id))) {
       return reply.code(403).send({ error: 'Sem acesso a esta chamada' });
     }
+    const caller = await prisma.user.findUnique({
+      where: { id: request.user!.id },
+      select: { avatarStoredName: true },
+    });
     const token = new AccessToken(config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET, {
       identity: request.user!.id,
       name: request.user!.username,
+      metadata: JSON.stringify({
+        avatarUrl: caller?.avatarStoredName ? `/api/avatars/${caller.avatarStoredName}` : null,
+      }),
     });
     token.addGrant({
       roomJoin: true,
@@ -950,6 +1411,258 @@ app.post(
   },
 );
 
+app.get('/stickers', { preHandler: requireReady }, async (request) => {
+  const stickers = await prisma.sticker.findMany({
+    where: { ownerId: request.user!.id },
+    orderBy: { createdAt: 'desc' },
+  });
+  return { stickers: stickers.map(stickerResponse) };
+});
+
+app.post('/stickers', { preHandler: requireReady }, async (request, reply) => {
+  const file = await request.file({ limits: { fileSize: 5 * 1024 ** 2 } });
+  if (!file) return reply.code(400).send({ error: 'Escolha uma imagem para a figurinha' });
+  const allowed = new Map([
+    ['image/png', '.png'],
+    ['image/webp', '.webp'],
+    ['image/gif', '.gif'],
+  ]);
+  const extension = allowed.get(file.mimetype);
+  if (!extension) {
+    return reply.code(415).send({ error: 'Use uma imagem PNG, WEBP ou GIF' });
+  }
+  const count = await prisma.sticker.count({ where: { ownerId: request.user!.id } });
+  if (count >= 50) return reply.code(409).send({ error: 'Limite de 50 figurinhas atingido' });
+  const directory = path.join(config.UPLOAD_DIR, 'stickers');
+  fs.mkdirSync(directory, { recursive: true });
+  const storedName = `${randomUUID()}${extension}`;
+  const filePath = path.join(directory, storedName);
+  await pipeline(file.file, fs.createWriteStream(filePath));
+  if (file.file.truncated) {
+    fs.rmSync(filePath, { force: true });
+    return reply.code(413).send({ error: 'A figurinha não pode exceder 5 MB' });
+  }
+  const stat = fs.statSync(filePath);
+  const requestedName = typeof file.fields.name === 'object' && 'value' in file.fields.name
+    ? String(file.fields.name.value)
+    : path.parse(file.filename).name;
+  const name = sanitizeHtml(requestedName, { allowedTags: [], allowedAttributes: {} })
+    .trim()
+    .slice(0, 40) || 'Figurinha';
+  const sticker = await prisma.sticker.create({
+    data: {
+      name,
+      storedName,
+      publicToken: createCdnToken(),
+      mimeType: file.mimetype,
+      size: stat.size,
+      ownerId: request.user!.id,
+    },
+  });
+  return reply.code(201).send({ sticker: stickerResponse(sticker) });
+});
+
+app.delete('/stickers/:id', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const sticker = await prisma.sticker.findFirst({
+    where: { id, ownerId: request.user!.id },
+  });
+  if (!sticker) return reply.code(404).send({ error: 'Figurinha não encontrada' });
+  await prisma.sticker.delete({ where: { id } });
+  fs.rmSync(path.join(config.UPLOAD_DIR, 'stickers', sticker.storedName), { force: true });
+  return { ok: true };
+});
+
+app.get('/stickers/content/:token', async (request, reply) => {
+  const { token } = request.params as { token: string };
+  if (!/^[A-Za-z0-9_-]{64}$/.test(token)) return reply.code(404).send();
+  const sticker = await prisma.sticker.findUnique({ where: { publicToken: token } });
+  if (!sticker) return reply.code(404).send();
+  const filePath = path.join(config.UPLOAD_DIR, 'stickers', sticker.storedName);
+  if (!fs.existsSync(filePath)) return reply.code(404).send();
+  reply.header('Content-Type', sticker.mimeType);
+  reply.header('Content-Length', sticker.size.toString());
+  reply.header('Cache-Control', 'public, max-age=31536000, immutable');
+  reply.header('X-Content-Type-Options', 'nosniff');
+  return reply.send(fs.createReadStream(filePath));
+});
+
+app.get('/giphy/search', { preHandler: requireReady }, async (request, reply) => {
+  if (!config.GIPHY_API_KEY) {
+    return reply.code(503).send({ error: 'Configure GIPHY_API_KEY para ativar a pesquisa de GIFs' });
+  }
+  const input = giphySearchSchema.parse(request.query);
+  const endpoint = input.q ? '/v1/gifs/search' : '/v1/gifs/trending';
+  const parameters = new URLSearchParams({
+    api_key: config.GIPHY_API_KEY,
+    limit: '24',
+    offset: String(input.offset),
+    rating: config.GIPHY_RATING,
+    country_code: config.GIPHY_COUNTRY_CODE.toUpperCase(),
+    customer_id: request.user!.id,
+    bundle: 'messaging_non_clips',
+  });
+  if (input.q) parameters.set('q', input.q);
+  const response = await fetch(`https://api.giphy.com${endpoint}?${parameters}`);
+  if (!response.ok) {
+    return reply.code(502).send({ error: 'O GIPHY não respondeu corretamente' });
+  }
+  const payload = await response.json() as { data?: GiphyItem[] };
+  return {
+    gifs: (payload.data ?? []).map(normalizeGiphyItem).filter(Boolean),
+    attribution: 'GIPHY',
+  };
+});
+
+app.post('/giphy/analytics', { preHandler: requireReady }, async (request, reply) => {
+  const { url } = request.body as { url?: string };
+  if (!url) return { ok: true };
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return reply.code(400).send({ error: 'URL de analytics inválido' });
+  }
+  if (parsed.protocol !== 'https:' || parsed.hostname !== 'giphy-analytics.giphy.com') {
+    return reply.code(400).send({ error: 'URL de analytics inválido' });
+  }
+  parsed.searchParams.set('customer_id', request.user!.id);
+  parsed.searchParams.set('ts', String(Date.now()));
+  await fetch(parsed, { method: 'GET' }).catch(() => undefined);
+  return { ok: true };
+});
+
+app.get('/forward-targets', { preHandler: requireReady }, async (request) => {
+  const [servers, conversations] = await Promise.all([
+    prisma.server.findMany({
+      where: { members: { some: { userId: request.user!.id } } },
+      select: {
+        id: true,
+        name: true,
+        channels: {
+          where: { type: 'TEXT' },
+          select: { id: true, name: true },
+          orderBy: { position: 'asc' },
+        },
+      },
+      orderBy: { name: 'asc' },
+    }),
+    prisma.directConversation.findMany({
+      where: { members: { some: { userId: request.user!.id } } },
+      include: {
+        members: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                username: true,
+                createdAt: true,
+                avatarStoredName: true,
+                presenceMode: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: { updatedAt: 'desc' },
+    }),
+  ]);
+  const directTargets = [];
+  for (const conversation of conversations) {
+    if (!conversation.isGroup) {
+      const other = conversation.members.find((member) => member.user.id !== request.user!.id);
+      if (other && await isBlockedBetween(request.user!.id, other.user.id)) continue;
+    }
+    directTargets.push(serializeDirectConversation(conversation, request.user!.id));
+  }
+  return { servers, conversations: directTargets };
+});
+
+app.post('/messages/forward', { preHandler: requireReady }, async (request, reply) => {
+  const input = forwardMessageSchema.parse(request.body);
+  let source: { content: string; author: { username: string } } | null = null;
+  if (input.sourceType === 'channel') {
+    const message = await prisma.message.findUnique({
+      where: { id: input.sourceMessageId },
+      include: { author: { select: { username: true } }, channel: true },
+    });
+    if (message && await isMember(request.user!.id, message.channel.serverId)) source = message;
+  } else {
+    const message = await prisma.directMessage.findUnique({
+      where: { id: input.sourceMessageId },
+      include: { author: { select: { username: true } } },
+    });
+    if (message && await getDirectConversation(request.user!.id, message.conversationId)) source = message;
+  }
+  if (!source) return reply.code(404).send({ error: 'Mensagem original não encontrada' });
+
+  if (input.targetType === 'channel') {
+    const channel = await prisma.channel.findUnique({ where: { id: input.targetId } });
+    if (!channel || channel.type !== 'TEXT' || !(await isMember(request.user!.id, channel.serverId))) {
+      return reply.code(403).send({ error: 'Sem acesso ao destino' });
+    }
+    const message = await prisma.message.create({
+      data: {
+        content: source.content,
+        forwardedFrom: displayUsername(source.author.username),
+        authorId: request.user!.id,
+        channelId: input.targetId,
+      },
+      include: {
+        author: { select: { id: true, username: true, avatarStoredName: true } },
+        uploads: true,
+      },
+    });
+    const responseMessage = {
+      ...message,
+      author: {
+        id: message.author.id,
+        username: displayUsername(message.author.username),
+        avatarUrl: message.author.avatarStoredName
+          ? `/avatars/${message.author.avatarStoredName}`
+          : null,
+      },
+    };
+    io.to(`channel:${input.targetId}`).emit('message:new', responseMessage);
+  } else {
+    if (!(await getDirectConversation(request.user!.id, input.targetId))) {
+      return reply.code(403).send({ error: 'Sem acesso ao destino' });
+    }
+    const message = await prisma.directMessage.create({
+      data: {
+        content: source.content,
+        forwardedFrom: displayUsername(source.author.username),
+        authorId: request.user!.id,
+        conversationId: input.targetId,
+      },
+      include: {
+        author: {
+          select: {
+            id: true,
+            username: true,
+            avatarStoredName: true,
+            presenceMode: true,
+          },
+        },
+      },
+    });
+    await prisma.directConversation.update({
+      where: { id: input.targetId },
+      data: { updatedAt: new Date() },
+    });
+    io.to(`dm:${input.targetId}`).emit('dm:message:new', {
+      ...message,
+      author: publicUser({
+        ...message.author,
+        isSuperAdmin: false,
+        mustChangePassword: false,
+        suspended: false,
+      }),
+    });
+  }
+  return reply.code(201).send({ ok: true });
+});
+
 app.get('/servers', { preHandler: requireReady }, async (request) => ({
   servers: (
     await prisma.server.findMany({
@@ -974,6 +1687,7 @@ app.get('/servers', { preHandler: requireReady }, async (request) => ({
     })
   ).map((server) => ({
     ...server,
+    imageUrl: server.imageStoredName ? `/server-images/${server.imageStoredName}` : server.imageUrl,
     members: server.members.map((member) => ({
       ...member,
       user: publicUser({
@@ -1081,6 +1795,64 @@ app.delete('/servers/:id', { preHandler: requireReady }, async (request, reply) 
   return { ok: true };
 });
 
+app.post('/servers/:id/image', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await canManage(request.user!.id, id))) {
+    return reply.code(403).send({ error: 'Sem permissão para alterar a imagem do servidor' });
+  }
+  const file = await request.file({ limits: { fileSize: 10 * 1024 ** 2 } });
+  if (!file) return reply.code(400).send({ error: 'Escolha uma imagem' });
+  const allowed = new Map([
+    ['image/jpeg', '.jpg'],
+    ['image/png', '.png'],
+    ['image/webp', '.webp'],
+    ['image/gif', '.gif'],
+    ['image/avif', '.avif'],
+  ]);
+  const extension = allowed.get(file.mimetype);
+  if (!extension) {
+    file.file.resume();
+    return reply.code(415).send({ error: 'Use uma imagem JPG, PNG, WebP, GIF ou AVIF' });
+  }
+  const directory = path.join(config.UPLOAD_DIR, 'server-images');
+  fs.mkdirSync(directory, { recursive: true });
+  const storedName = `${randomUUID()}${extension}`;
+  const filePath = path.join(directory, storedName);
+  await pipeline(file.file, fs.createWriteStream(filePath));
+  if (file.file.truncated) {
+    fs.rmSync(filePath, { force: true });
+    return reply.code(413).send({ error: 'A imagem não pode exceder 10 MB' });
+  }
+  const previous = await prisma.server.findUnique({ where: { id } });
+  await prisma.server.update({
+    where: { id },
+    data: { imageStoredName: storedName },
+  });
+  if (previous?.imageStoredName && previous.imageStoredName !== storedName) {
+    fs.rmSync(path.join(directory, previous.imageStoredName), { force: true });
+  }
+  const imageUrl = `/server-images/${storedName}`;
+  io.to(`server:${id}`).emit('server:update', { serverId: id, imageUrl });
+  return { imageUrl };
+});
+
+app.delete('/servers/:id/image', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await canManage(request.user!.id, id))) {
+    return reply.code(403).send({ error: 'Sem permissão para alterar a imagem do servidor' });
+  }
+  const previous = await prisma.server.findUnique({ where: { id } });
+  await prisma.server.update({
+    where: { id },
+    data: { imageStoredName: null, imageUrl: null },
+  });
+  if (previous?.imageStoredName) {
+    fs.rmSync(path.join(config.UPLOAD_DIR, 'server-images', previous.imageStoredName), { force: true });
+  }
+  io.to(`server:${id}`).emit('server:update', { serverId: id, imageUrl: null });
+  return { imageUrl: null };
+});
+
 app.post('/servers/:id/channels', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
   if (!(await canManage(request.user!.id, id))) {
@@ -1107,6 +1879,11 @@ app.get('/channels/:id/messages', { preHandler: requireReady }, async (request, 
     include: {
       author: { select: { id: true, username: true, avatarStoredName: true } },
       uploads: true,
+      replyTo: {
+        include: {
+          author: { select: { id: true, username: true, avatarStoredName: true } },
+        },
+      },
     },
     orderBy: { createdAt: 'desc' },
     take: 50,
@@ -1115,15 +1892,65 @@ app.get('/channels/:id/messages', { preHandler: requireReady }, async (request, 
   return {
     messages: messages.reverse().map((message) => ({
       ...message,
+      replyTo: serializeReply(message.replyTo),
       author: {
         id: message.author.id,
-        username: message.author.username,
+        username: displayUsername(message.author.username),
         avatarUrl: message.author.avatarStoredName
           ? `/avatars/${message.author.avatarStoredName}`
           : null,
       },
       uploads: message.uploads.map((upload) => ({ ...upload, size: Number(upload.size) })),
     })),
+  };
+});
+
+app.get('/channels/:id/search', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { q = '', category = 'messages' } = request.query as {
+    q?: string;
+    category?: string;
+  };
+  const channel = await prisma.channel.findUnique({ where: { id } });
+  if (!channel || !(await isMember(request.user!.id, channel.serverId))) {
+    return reply.code(403).send({ error: 'Sem acesso ao canal' });
+  }
+  if (!['messages', 'images', 'videos', 'files', 'links'].includes(category)) {
+    return reply.code(400).send({ error: 'Categoria inválida' });
+  }
+  const messages = await prisma.message.findMany({
+    where: {
+      channelId: id,
+      ...(q.trim() ? { content: { contains: q.trim(), mode: 'insensitive' } } : {}),
+    },
+    include: {
+      author: { select: { id: true, username: true, avatarStoredName: true } },
+      uploads: true,
+      replyTo: {
+        include: {
+          author: { select: { id: true, username: true, avatarStoredName: true } },
+        },
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 300,
+  });
+  return {
+    messages: messages
+      .filter((message) => matchesSearchCategory(message.content, category))
+      .slice(0, 100)
+      .map((message) => ({
+        ...message,
+        replyTo: serializeReply(message.replyTo),
+        author: {
+          id: message.author.id,
+          username: displayUsername(message.author.username),
+          avatarUrl: message.author.avatarStoredName
+            ? `/avatars/${message.author.avatarStoredName}`
+            : null,
+        },
+        uploads: message.uploads.map((upload) => ({ ...upload, size: Number(upload.size) })),
+      })),
   };
 });
 
@@ -1135,18 +1962,30 @@ app.post('/channels/:id/messages', { preHandler: requireReady }, async (request,
   }
   const input = messageSchema.parse(request.body);
   const content = sanitizeHtml(input.content, { allowedTags: [], allowedAttributes: {} });
+  if (input.replyToId) {
+    const replyTarget = await prisma.message.findFirst({
+      where: { id: input.replyToId, channelId: id },
+    });
+    if (!replyTarget) return reply.code(400).send({ error: 'Mensagem original não encontrada' });
+  }
   const message = await prisma.message.create({
     data: { content, replyToId: input.replyToId, authorId: request.user!.id, channelId: id },
     include: {
       author: { select: { id: true, username: true, avatarStoredName: true } },
       uploads: true,
+      replyTo: {
+        include: {
+          author: { select: { id: true, username: true, avatarStoredName: true } },
+        },
+      },
     },
   });
   const responseMessage = {
     ...message,
+    replyTo: serializeReply(message.replyTo),
     author: {
       id: message.author.id,
-      username: message.author.username,
+      username: displayUsername(message.author.username),
       avatarUrl: message.author.avatarStoredName
         ? `/avatars/${message.author.avatarStoredName}`
         : null,
@@ -1260,9 +2099,16 @@ app.post('/channels/:id/call-token', { preHandler: requireReady }, async (reques
   if (!channel || channel.type === 'TEXT' || !(await isMember(request.user!.id, channel.serverId))) {
     return reply.code(403).send({ error: 'Sem permissão para entrar na chamada' });
   }
+  const caller = await prisma.user.findUnique({
+    where: { id: request.user!.id },
+    select: { avatarStoredName: true },
+  });
   const token = new AccessToken(config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET, {
     identity: request.user!.id,
     name: request.user!.username,
+    metadata: JSON.stringify({
+      avatarUrl: caller?.avatarStoredName ? `/api/avatars/${caller.avatarStoredName}` : null,
+    }),
   });
   token.addGrant({ roomJoin: true, room: `channel-${id}`, canPublish: true, canSubscribe: true });
   return { token: await token.toJwt() };

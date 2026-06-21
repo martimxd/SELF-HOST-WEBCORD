@@ -44,6 +44,9 @@ services:
       UPLOAD_DIR: /data/uploads
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env}
+      GIPHY_API_KEY: ${GIPHY_API_KEY:-}
+      GIPHY_RATING: ${GIPHY_RATING:-pg-13}
+      GIPHY_COUNTRY_CODE: ${GIPHY_COUNTRY_CODE:-PT}
     volumes: [uploads_data:/data/uploads]
     ports: ["4000:4000"]
     depends_on:

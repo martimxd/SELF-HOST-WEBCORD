@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, AtSign, Camera, Globe2, LogOut, Save, Trash2 } from 'lucide-react';
+import { AlignLeft, ArrowLeft, AtSign, Camera, Globe2, LogOut, MessageSquareText, Save, Trash2 } from 'lucide-react';
 import { LanguageSelect, useI18n } from '../i18n';
 import type { User } from '../types';
 import { api } from '../api';
@@ -20,6 +20,8 @@ export function UserSettings({
   const [error, setError] = useState('');
   const [preview, setPreview] = useState('');
   const [username, setUsername] = useState(user.username);
+  const [bio, setBio] = useState(user.bio || '');
+  const [customStatus, setCustomStatus] = useState(user.customStatus || '');
   const [notice, setNotice] = useState('');
 
   useEffect(() => () => {
@@ -56,16 +58,16 @@ export function UserSettings({
     onUserUpdated(result.user);
   };
 
-  const updateUsername = async (event: React.FormEvent) => {
+  const updateProfile = async (event: React.FormEvent) => {
     event.preventDefault();
     setError('');
     try {
       const result = await api<{ user: User }>('/users/me', {
         method: 'PATCH',
-        body: JSON.stringify({ username }),
+        body: JSON.stringify({ username, bio, customStatus }),
       });
       onUserUpdated(result.user);
-      setNotice('Username alterado');
+      setNotice('Perfil atualizado');
     } catch (err) {
       setError((err as Error).message);
     }
@@ -85,7 +87,8 @@ export function UserSettings({
         </div>
         <LanguageSelect />
       </section>
-      <form className="panel settings-panel username-settings" onSubmit={updateUsername}>
+      <form className="profile-settings-form" onSubmit={updateProfile}>
+      <section className="panel settings-panel username-settings">
         <AtSign size={34} />
         <div>
           <h2>Username</h2>
@@ -93,8 +96,22 @@ export function UserSettings({
         </div>
         <div className="username-setting-control">
           <input minLength={3} maxLength={32} value={username} onChange={(event) => setUsername(event.target.value)} />
-          <button className="primary" disabled={username === user.username}><Save size={17} /> Guardar</button>
         </div>
+      </section>
+      <section className="panel settings-panel profile-text-setting">
+        <MessageSquareText size={34} />
+        <div><h2>Status personalizado</h2><p>Uma frase curta apresentada no teu perfil.</p></div>
+        <input maxLength={80} value={customStatus} onChange={(event) => setCustomStatus(event.target.value)} placeholder="O que estás a fazer?" />
+      </section>
+      <section className="panel settings-panel profile-text-setting bio-setting">
+        <AlignLeft size={34} />
+        <div><h2>Bio</h2><p>Conta algo sobre ti. Máximo de 400 caracteres.</p></div>
+        <div className="bio-control">
+          <textarea maxLength={400} value={bio} onChange={(event) => setBio(event.target.value)} placeholder="Escreve a tua bio…" />
+          <small>{bio.length}/400</small>
+        </div>
+      </section>
+      <button className="primary profile-save" disabled={username === user.username && bio === (user.bio || '') && customStatus === (user.customStatus || '')}><Save size={17} /> Guardar perfil</button>
       </form>
       <section className="panel avatar-settings">
         {preview
