@@ -1,9 +1,11 @@
 import { useState } from 'react';
 import {
   ControlBar,
+  LayoutContextProvider,
   LiveKitRoom,
   ParticipantTile,
   RoomAudioRenderer,
+  VideoTrack,
   useTracks,
 } from '@livekit/components-react';
 import { Mic, MicOff, MonitorUp, Video } from 'lucide-react';
@@ -28,8 +30,12 @@ function CallStage() {
       <div className="call-grid" style={{ '--participant-count': tracks.length } as React.CSSProperties}>
         {tracks.map((trackRef) => {
           const participant = trackRef.participant;
-          const cameraOff = trackRef.source === Track.Source.Camera
-            && (!trackRef.publication || trackRef.publication.isMuted);
+          const hasVisibleVideo = Boolean(
+            trackRef.publication
+            && !trackRef.publication.isMuted
+            && trackRef.publication.track,
+          );
+          const cameraOff = trackRef.source === Track.Source.Camera && !hasVisibleVideo;
           const microphone = participant.getTrackPublication(Track.Source.Microphone);
           let avatarUrl = '';
           try {
@@ -42,7 +48,9 @@ function CallStage() {
               className={`call-participant ${participant.isSpeaking ? 'speaking' : ''}`}
               key={`${participant.identity}-${trackRef.source}`}
             >
-              <ParticipantTile trackRef={trackRef} />
+              <ParticipantTile trackRef={trackRef} disableSpeakingIndicator>
+                <>{hasVisibleVideo && <VideoTrack />}</>
+              </ParticipantTile>
               {cameraOff && (
                 <div className="call-avatar-placeholder">
                   {avatarUrl
@@ -74,6 +82,7 @@ export function CallRoom({ name, tokenEndpoint, videoEnabled }: CallRoomProps) {
   const [token, setToken] = useState('');
   const [quality, setQuality] = useState<QualityProfile>('medium');
   const [error, setError] = useState('');
+  const [joining, setJoining] = useState(false);
   const livekitUrl = import.meta.env.VITE_LIVEKIT_URL
     || `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/livekit`;
 
@@ -82,11 +91,15 @@ export function CallRoom({ name, tokenEndpoint, videoEnabled }: CallRoomProps) {
       setError('Este navegador não suporta chamadas WebRTC.');
       return;
     }
+    setJoining(true);
+    setError('');
     try {
       const result = await api<{ token: string }>(tokenEndpoint, { method: 'POST' });
       setToken(result.token);
     } catch (err) {
       setError((err as Error).message);
+    } finally {
+      setJoining(false);
     }
   };
 
@@ -104,7 +117,9 @@ export function CallRoom({ name, tokenEndpoint, videoEnabled }: CallRoomProps) {
             <option value="high">1080p · 60 fps</option>
           </select>
         </label>
-        <button className="primary" onClick={join}>Entrar na chamada</button>
+        <button className="primary" disabled={joining} onClick={join}>
+          {joining ? 'A entrar…' : 'Entrar na chamada'}
+        </button>
         {error && <div className="form-error">{error}</div>}
       </div>
     );
@@ -126,8 +141,14 @@ export function CallRoom({ name, tokenEndpoint, videoEnabled }: CallRoomProps) {
         } : false}
         audio
         onDisconnected={() => setToken('')}
+        onError={(roomError) => {
+          setError(roomError.message || 'Não foi possível ligar à chamada.');
+          setToken('');
+        }}
       >
-        <CallStage />
+        <LayoutContextProvider>
+          <CallStage />
+        </LayoutContextProvider>
       </LiveKitRoom>
     </div>
   );

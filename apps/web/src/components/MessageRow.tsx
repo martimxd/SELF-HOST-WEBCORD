@@ -8,11 +8,13 @@ export function MessageRow({
   onReply,
   onForward,
   onProfile,
+  authorDisplayName,
 }: {
   message: Message;
   onReply: (message: Message) => void;
   onForward: (message: Message) => void;
   onProfile?: (user: Pick<User, 'id' | 'username' | 'avatarUrl' | 'status'>) => void;
+  authorDisplayName?: string;
 }) {
   return (
     <article className="message">
@@ -35,7 +37,7 @@ export function MessageRow({
           <div className="forwarded-label"><Forward size={12} /> Reencaminhada de @{message.forwardedFrom}</div>
         )}
         <button className="username-button" onClick={() => onProfile?.(message.author)}>
-          <strong>@{message.author.username}</strong>
+          <strong>{authorDisplayName || `@${message.author.username}`}</strong>
         </button>
         <time>{new Date(message.createdAt).toLocaleString('pt-PT')}</time>
         <MessageContent content={message.content} />

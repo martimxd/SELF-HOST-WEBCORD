@@ -31,6 +31,7 @@ export type Server = {
 
 export type Message = {
   id: string;
+  channelId?: string;
   conversationId?: string;
   content: string;
   createdAt: string;
@@ -50,8 +51,14 @@ export type DirectConversation = {
   ownerId: string | null;
   members: Array<Pick<User, 'id' | 'username' | 'createdAt' | 'avatarUrl' | 'status'>>;
   otherUser: Pick<User, 'id' | 'username' | 'createdAt' | 'avatarUrl' | 'status'> | null;
+  nickname: string | null;
   lastMessage: { content: string; createdAt: string } | null;
   updatedAt: string;
+};
+
+export type MessagePage = {
+  messages: Message[];
+  nextCursor: string | null;
 };
 
 export type FriendRequest = {

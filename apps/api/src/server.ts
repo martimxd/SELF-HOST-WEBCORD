@@ -19,6 +19,7 @@ import {
   directConversationSchema,
   directGroupMemberSchema,
   directGroupSchema,
+  directNicknameSchema,
   forwardMessageSchema,
   friendRequestSchema,
   giphySearchSchema,
@@ -175,6 +176,7 @@ function serializeDirectConversation(
     ownerId: string | null;
     updatedAt: Date;
     members: Array<{
+      nickname?: string | null;
       user: {
         id: string;
         username: string;
@@ -197,6 +199,9 @@ function serializeDirectConversation(
     }),
   );
   const otherUser = members.find((member) => member.id !== currentUserId) ?? null;
+  const nickname = conversation.members.find(
+    (member) => member.user.id === currentUserId,
+  )?.nickname?.trim() || null;
   return {
     id: conversation.id,
     name: conversation.isGroup ? conversation.name : otherUser?.username,
@@ -204,6 +209,7 @@ function serializeDirectConversation(
     ownerId: conversation.ownerId,
     members,
     otherUser,
+    nickname: conversation.isGroup ? null : nickname,
     lastMessage: conversation.messages?.[0] ?? null,
     updatedAt: conversation.updatedAt,
   };
@@ -1184,6 +1190,7 @@ app.get(
   { preHandler: requireReady },
   async (request, reply) => {
     const { id } = request.params as { id: string };
+    const { cursor } = request.query as { cursor?: string };
     if (!(await getDirectConversation(request.user!.id, id))) {
       return reply.code(403).send({ error: 'Sem acesso a esta conversa' });
     }
@@ -1206,11 +1213,15 @@ app.get(
           },
         },
       },
-      orderBy: { createdAt: 'asc' },
-      take: 100,
+      orderBy: { createdAt: 'desc' },
+      take: 51,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
+    const hasMore = messages.length > 50;
+    const page = messages.slice(0, 50);
+    const nextCursor = hasMore ? page[page.length - 1]?.id ?? null : null;
     return {
-      messages: messages.map((message) => ({
+      messages: [...page].reverse().map((message) => ({
         ...message,
         replyTo: serializeReply(message.replyTo),
         author: publicUser({
@@ -1220,7 +1231,31 @@ app.get(
           suspended: false,
         }),
       })),
+      nextCursor,
     };
+  },
+);
+
+app.patch(
+  '/direct-conversations/:id/nickname',
+  { preHandler: requireReady },
+  async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = directNicknameSchema.parse(request.body);
+    const conversation = await getDirectConversation(request.user!.id, id);
+    if (!conversation || conversation.isGroup) {
+      return reply.code(404).send({ error: 'Conversa privada não encontrada' });
+    }
+    await prisma.directConversationMember.update({
+      where: {
+        conversationId_userId: {
+          conversationId: id,
+          userId: request.user!.id,
+        },
+      },
+      data: { nickname: input.nickname || null },
+    });
+    return { nickname: input.nickname || null };
   },
 );
 
@@ -1276,6 +1311,11 @@ app.post(
       }),
     };
     io.to(`dm:${id}`).emit('dm:message:new', responseMessage);
+    for (const member of conversation.members) {
+      if (member.user.id !== request.user!.id) {
+        io.to(`user:${member.user.id}`).emit('dm:notification', responseMessage);
+      }
+    }
     return reply.code(201).send({ message: responseMessage });
   },
 );
@@ -1625,7 +1665,8 @@ app.post('/messages/forward', { preHandler: requireReady }, async (request, repl
     };
     io.to(`channel:${input.targetId}`).emit('message:new', responseMessage);
   } else {
-    if (!(await getDirectConversation(request.user!.id, input.targetId))) {
+    const conversation = await getDirectConversation(request.user!.id, input.targetId);
+    if (!conversation) {
       return reply.code(403).send({ error: 'Sem acesso ao destino' });
     }
     const message = await prisma.directMessage.create({
@@ -1650,7 +1691,7 @@ app.post('/messages/forward', { preHandler: requireReady }, async (request, repl
       where: { id: input.targetId },
       data: { updatedAt: new Date() },
     });
-    io.to(`dm:${input.targetId}`).emit('dm:message:new', {
+    const responseMessage = {
       ...message,
       author: publicUser({
         ...message.author,
@@ -1658,7 +1699,13 @@ app.post('/messages/forward', { preHandler: requireReady }, async (request, repl
         mustChangePassword: false,
         suspended: false,
       }),
-    });
+    };
+    io.to(`dm:${input.targetId}`).emit('dm:message:new', responseMessage);
+    for (const member of conversation.members) {
+      if (member.user.id !== request.user!.id) {
+        io.to(`user:${member.user.id}`).emit('dm:notification', responseMessage);
+      }
+    }
   }
   return reply.code(201).send({ ok: true });
 });
@@ -1886,11 +1933,14 @@ app.get('/channels/:id/messages', { preHandler: requireReady }, async (request, 
       },
     },
     orderBy: { createdAt: 'desc' },
-    take: 50,
+    take: 51,
     ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });
+  const hasMore = messages.length > 50;
+  const page = messages.slice(0, 50);
+  const nextCursor = hasMore ? page[page.length - 1]?.id ?? null : null;
   return {
-    messages: messages.reverse().map((message) => ({
+    messages: [...page].reverse().map((message) => ({
       ...message,
       replyTo: serializeReply(message.replyTo),
       author: {
@@ -1902,6 +1952,7 @@ app.get('/channels/:id/messages', { preHandler: requireReady }, async (request, 
       },
       uploads: message.uploads.map((upload) => ({ ...upload, size: Number(upload.size) })),
     })),
+    nextCursor,
   };
 });
 

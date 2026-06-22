@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Ban,
@@ -8,6 +8,7 @@ import {
   MessageCircle,
   Mic,
   Plus,
+  Pencil,
   Search,
   Send,
   Search as SearchIcon,
@@ -25,6 +26,7 @@ import type {
   DirectConversation,
   FriendsPayload,
   Message,
+  MessagePage,
   User,
 } from '../types';
 import { CallRoom } from './CallRoom';
@@ -49,11 +51,17 @@ export function DirectMessages({
   socket,
   onBack,
   initialUsername,
+  unreadCounts,
+  onConversationRead,
+  onActiveConversationChange,
 }: {
   currentUser: User;
   socket: Socket;
   onBack: () => void;
   initialUsername?: string;
+  unreadCounts: Record<string, number>;
+  onConversationRead: (conversationId: string) => void;
+  onActiveConversationChange: (conversationId: string) => void;
 }) {
   const [conversations, setConversations] = useState<DirectConversation[]>([]);
   const [friends, setFriends] = useState<FriendsPayload>(emptyFriends);
@@ -64,7 +72,7 @@ export function DirectMessages({
   const [callMode, setCallMode] = useState<'audio' | 'video' | null>(null);
   const [profile, setProfile] = useState<User | null>(null);
   const [section, setSection] = useState<'chats' | 'friends'>('chats');
-  const [dialog, setDialog] = useState<'dm' | 'group' | 'members' | null>(null);
+  const [dialog, setDialog] = useState<'dm' | 'group' | 'members' | 'nickname' | null>(null);
   const [friendUsername, setFriendUsername] = useState('');
   const [groupName, setGroupName] = useState('');
   const [selectedFriends, setSelectedFriends] = useState<string[]>([]);
@@ -75,12 +83,22 @@ export function DirectMessages({
   const [forwardingMessage, setForwardingMessage] = useState<Message | null>(null);
   const [mediaPicker, setMediaPicker] = useState<'gifs' | 'stickers' | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [messageCursor, setMessageCursor] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [nickname, setNickname] = useState('');
+  const [isMobile, setIsMobile] = useState(() => window.matchMedia('(max-width: 800px)').matches);
+  const messagesRef = useRef<HTMLElement>(null);
   const selected = conversations.find((item) => item.id === selectedId);
 
   const loadConversations = async () => {
     const result = await api<{ conversations: DirectConversation[] }>('/direct-conversations');
     setConversations(result.conversations);
-    setSelectedId((current) => current || result.conversations[0]?.id || '');
+    setSelectedId((current) => {
+      if (current && result.conversations.some((conversation) => conversation.id === current)) {
+        return current;
+      }
+      return isMobile ? '' : result.conversations[0]?.id || '';
+    });
   };
 
   const loadFriends = async () => {
@@ -120,6 +138,13 @@ export function DirectMessages({
   }, []);
 
   useEffect(() => {
+    const media = window.matchMedia('(max-width: 800px)');
+    const update = () => setIsMobile(media.matches);
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
+
+  useEffect(() => {
     if (!initialUsername) return;
     openUsername(initialUsername).catch((err) => {
       setFriendUsername(initialUsername);
@@ -129,20 +154,41 @@ export function DirectMessages({
   }, [initialUsername]);
 
   useEffect(() => {
-    if (!selectedId) return;
+    if (!selectedId) {
+      setMessages([]);
+      setMessageCursor(null);
+      onActiveConversationChange('');
+      return;
+    }
     setCallMode(null);
     setReplyingTo(null);
     setMediaPicker(null);
     setSearchOpen(false);
-    api<{ messages: Message[] }>(`/direct-conversations/${selectedId}/messages`)
-      .then((result) => setMessages(result.messages))
+    onActiveConversationChange(selectedId);
+    onConversationRead(selectedId);
+    api<MessagePage>(`/direct-conversations/${selectedId}/messages`)
+      .then((result) => {
+        setMessages(result.messages);
+        setMessageCursor(result.nextCursor);
+        requestAnimationFrame(() => {
+          if (messagesRef.current) messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
+        });
+      })
       .catch((err) => setError(err.message));
     socket.emit('dm:join', selectedId);
     const onMessage = (message: Message) => {
       if (message.conversationId !== selectedId) return;
+      const shouldFollow = !messagesRef.current
+        || messagesRef.current.scrollHeight - messagesRef.current.scrollTop - messagesRef.current.clientHeight < 140;
       setMessages((items) =>
         items.some((item) => item.id === message.id) ? items : [...items, message],
       );
+      loadConversations().catch((err) => setError(err.message));
+      if (shouldFollow) {
+        requestAnimationFrame(() => {
+          if (messagesRef.current) messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
+        });
+      }
     };
     const onConversationUpdate = () => loadConversations().catch((err) => setError(err.message));
     const onMemberRemoved = ({ conversationId, userId }: { conversationId: string; userId: string }) => {
@@ -160,6 +206,16 @@ export function DirectMessages({
       socket.off('dm:member:removed', onMemberRemoved);
     };
   }, [selectedId, socket, currentUser.id]);
+
+  useEffect(() => () => onActiveConversationChange(''), [onActiveConversationChange]);
+
+  useEffect(() => {
+    const refreshConversations = () => loadConversations().catch((err) => setError(err.message));
+    socket.on('dm:notification', refreshConversations);
+    return () => {
+      socket.off('dm:notification', refreshConversations);
+    };
+  }, [socket, isMobile]);
 
   useEffect(() => {
     const handler = ({ userId, status }: { userId: string; status: 'online' | 'offline' }) => {
@@ -354,6 +410,49 @@ export function DirectMessages({
     setReplyingTo(null);
   };
 
+  const loadOlderMessages = async () => {
+    if (!selectedId || !messageCursor || loadingOlder) return;
+    const container = messagesRef.current;
+    const previousHeight = container?.scrollHeight ?? 0;
+    setLoadingOlder(true);
+    try {
+      const result = await api<MessagePage>(
+        `/direct-conversations/${selectedId}/messages?cursor=${encodeURIComponent(messageCursor)}`,
+      );
+      setMessages((current) => [...result.messages, ...current]);
+      setMessageCursor(result.nextCursor);
+      requestAnimationFrame(() => {
+        if (container) container.scrollTop += container.scrollHeight - previousHeight;
+      });
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
+
+  const saveNickname = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!selected || selected.isGroup) return;
+    try {
+      const result = await api<{ nickname: string | null }>(
+        `/direct-conversations/${selected.id}/nickname`,
+        { method: 'PATCH', body: JSON.stringify({ nickname }) },
+      );
+      setConversations((items) =>
+        items.map((conversation) =>
+          conversation.id === selected.id
+            ? { ...conversation, nickname: result.nickname }
+            : conversation,
+        ),
+      );
+      setDialog(null);
+      setNotice(result.nickname ? 'Apelido guardado' : 'Apelido removido');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   const upload = async (file: File) => {
     if (!selectedId) return;
     const form = new FormData();
@@ -385,11 +484,11 @@ export function DirectMessages({
   const title = selected?.isGroup
     ? selected.name
     : selected?.otherUser
-      ? `@${selected.otherUser.username}`
+      ? selected.nickname || `@${selected.otherUser.username}`
       : '';
 
   return (
-    <div className="dm-page">
+    <div className={`dm-page ${selected ? 'conversation-selected' : ''}`}>
       <aside className="dm-sidebar">
         <header><button onClick={onBack}><ArrowLeft /></button><strong>Mensagens</strong></header>
         <div className="dm-tabs">
@@ -412,13 +511,19 @@ export function DirectMessages({
                 <button
                   key={conversation.id}
                   className={conversation.id === selectedId ? 'active' : ''}
-                  onClick={() => setSelectedId(conversation.id)}
+                  onClick={() => {
+                    setSelectedId(conversation.id);
+                    onConversationRead(conversation.id);
+                  }}
                 >
                   <ConversationAvatar conversation={conversation} />
                   <div>
-                    <strong>{conversation.isGroup ? conversation.name : `@${conversation.otherUser?.username}`}</strong>
+                    <strong>{conversation.isGroup ? conversation.name : conversation.nickname || `@${conversation.otherUser?.username}`}</strong>
                     <small>{conversation.lastMessage?.content || `${conversation.members.length} membro${conversation.members.length === 1 ? '' : 's'}`}</small>
                   </div>
+                  {(unreadCounts[conversation.id] ?? 0) > 0 && (
+                    <span className="dm-unread">{Math.min(unreadCounts[conversation.id] ?? 0, 99)}</span>
+                  )}
                 </button>
               ))}
             </div>
@@ -489,6 +594,9 @@ export function DirectMessages({
         {selected ? (
           <>
             <header className="chat-header">
+              <button className="mobile-conversation-back" onClick={() => setSelectedId('')} title="Voltar às conversas">
+                <ArrowLeft />
+              </button>
               <button
                 className="profile-name"
                 onClick={() => selected.otherUser && openProfile(selected.otherUser.username)}
@@ -497,6 +605,18 @@ export function DirectMessages({
                 <strong>{title}</strong>
               </button>
               {selected.isGroup && <span>{selected.members.length}/10 membros</span>}
+              {!selected.isGroup && (
+                <button
+                  className="call-action nickname-action"
+                  onClick={() => {
+                    setNickname(selected.nickname || '');
+                    setDialog('nickname');
+                  }}
+                  title="Definir apelido"
+                >
+                  <Pencil />
+                </button>
+              )}
               <button className="push-right call-action" onClick={() => setCallMode('audio')} title="Chamada de voz"><Mic /></button>
               <button className="call-action" onClick={() => setCallMode('video')} title="Chamada de vídeo"><Video /></button>
               <button className="call-action" onClick={() => setSearchOpen((current) => !current)} title="Pesquisar"><SearchIcon /></button>
@@ -510,12 +630,17 @@ export function DirectMessages({
               />
             ) : (
               <>
-                <section className="messages">
+                <section className="messages" ref={messagesRef}>
                   <div className="channel-intro">
                     <div>{selected.isGroup ? <Users /> : <MessageCircle />}</div>
                     <h1>{title}</h1>
                     <p>{selected.isGroup ? `Grupo privado com ${selected.members.length} membros.` : 'Esta é uma conversa privada entre amigos.'}</p>
                   </div>
+                  {messageCursor && (
+                    <button className="load-older" disabled={loadingOlder} onClick={loadOlderMessages}>
+                      {loadingOlder ? 'A carregar…' : 'Carregar mensagens anteriores'}
+                    </button>
+                  )}
                   {messages.map((message) => (
                     <MessageRow
                       key={message.id}
@@ -523,6 +648,13 @@ export function DirectMessages({
                       onReply={setReplyingTo}
                       onForward={setForwardingMessage}
                       onProfile={(author) => openProfile(author.username)}
+                      authorDisplayName={
+                        !selected.isGroup
+                        && selected.nickname
+                        && message.author.id === selected.otherUser?.id
+                          ? selected.nickname
+                          : undefined
+                      }
                     />
                   ))}
                 </section>
@@ -624,6 +756,28 @@ export function DirectMessages({
               ))}
             </div>
           </section>
+        </div>
+      )}
+
+      {dialog === 'nickname' && selected && !selected.isGroup && (
+        <div className="modal-backdrop" onClick={() => setDialog(null)}>
+          <form className="dialog-card nickname-dialog" onSubmit={saveNickname} onClick={(event) => event.stopPropagation()}>
+            <button type="button" className="modal-close" onClick={() => setDialog(null)}><X /></button>
+            <span className="eyebrow">APELIDO PESSOAL</span>
+            <h2>Como queres chamar @{selected.otherUser?.username}?</h2>
+            <label>
+              Apelido
+              <input
+                autoFocus
+                maxLength={40}
+                value={nickname}
+                onChange={(event) => setNickname(event.target.value)}
+                placeholder={selected.otherUser?.username}
+              />
+            </label>
+            <p className="muted">Só tu vês este apelido. Deixa vazio para voltar ao username original.</p>
+            <button className="primary">Guardar apelido</button>
+          </form>
         </div>
       )}
 

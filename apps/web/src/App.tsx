@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import {
   Camera,
@@ -20,7 +20,7 @@ import {
   Video,
 } from 'lucide-react';
 import { API_URL, api, attachmentMessage, copyText, type UploadedFile } from './api';
-import type { Channel, Message, Server, User } from './types';
+import type { Channel, Message, MessagePage, Server, User } from './types';
 import { Login } from './components/Login';
 import { InitialChange } from './components/InitialChange';
 import { Admin } from './components/Admin';
@@ -36,6 +36,7 @@ import { ForwardDialog } from './components/ForwardDialog';
 import { MediaPicker } from './components/MediaPicker';
 import { RegisterInvite } from './components/RegisterInvite';
 import { SearchPanel } from './components/SearchPanel';
+import { enableNotificationSound, playDirectMessageSound } from './notifications';
 
 const socket = io(import.meta.env.VITE_SOCKET_URL || window.location.origin, {
   autoConnect: false,
@@ -61,6 +62,11 @@ export function App() {
   const [forwardingMessage, setForwardingMessage] = useState<Message | null>(null);
   const [mediaPicker, setMediaPicker] = useState<'gifs' | 'stickers' | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [messageCursor, setMessageCursor] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [dmUnread, setDmUnread] = useState<Record<string, number>>({});
+  const [activeDirectConversationId, setActiveDirectConversationId] = useState('');
+  const messagesRef = useRef<HTMLElement>(null);
   const registrationToken = new URLSearchParams(window.location.search).get('register');
 
   const server = servers.find((item) => item.id === serverId);
@@ -98,6 +104,37 @@ export function App() {
       socket.disconnect();
     };
   }, [user?.id, user?.username, user?.mustChangePassword, loadServers]);
+
+  useEffect(() => {
+    const enable = () => { void enableNotificationSound(); };
+    window.addEventListener('pointerdown', enable, { once: true });
+    window.addEventListener('keydown', enable, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', enable);
+      window.removeEventListener('keydown', enable);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!user || user.mustChangePassword) return;
+    const onDirectNotification = (message: Message) => {
+      if (!message.conversationId || message.author.id === user.id) return;
+      void playDirectMessageSound();
+      const isReadingConversation = view === 'dms'
+        && activeDirectConversationId === message.conversationId
+        && document.visibilityState === 'visible';
+      if (!isReadingConversation) {
+        setDmUnread((current) => ({
+          ...current,
+          [message.conversationId!]: (current[message.conversationId!] ?? 0) + 1,
+        }));
+      }
+    };
+    socket.on('dm:notification', onDirectNotification);
+    return () => {
+      socket.off('dm:notification', onDirectNotification);
+    };
+  }, [activeDirectConversationId, user?.id, user?.mustChangePassword, view]);
 
   useEffect(() => {
     if (!user || user.mustChangePassword) return;
@@ -194,20 +231,34 @@ export function App() {
   useEffect(() => {
     if (!channelId || channel?.type !== 'TEXT') {
       setMessages([]);
+      setMessageCursor(null);
       setReplyingTo(null);
       setMediaPicker(null);
       setSearchOpen(false);
       return;
     }
-    api<{ messages: Message[] }>(`/channels/${channelId}/messages`)
-      .then((data) => setMessages(data.messages))
+    api<MessagePage>(`/channels/${channelId}/messages`)
+      .then((data) => {
+        setMessages(data.messages);
+        setMessageCursor(data.nextCursor);
+        requestAnimationFrame(() => {
+          if (messagesRef.current) messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
+        });
+      })
       .catch((err) => setError(err.message));
     socket.emit('channel:join', channelId);
     const onMessage = (message: Message) => {
-      if (message && typeof message === 'object') {
+      if (message && typeof message === 'object' && message.channelId === channelId) {
+        const shouldFollow = !messagesRef.current
+          || messagesRef.current.scrollHeight - messagesRef.current.scrollTop - messagesRef.current.clientHeight < 140;
         setMessages((current) =>
           current.some((item) => item.id === message.id) ? current : [...current, message],
         );
+        if (shouldFollow) {
+          requestAnimationFrame(() => {
+            if (messagesRef.current) messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
+          });
+        }
       }
     };
     socket.on('message:new', onMessage);
@@ -215,6 +266,27 @@ export function App() {
       socket.off('message:new', onMessage);
     };
   }, [channelId, channel?.type]);
+
+  const loadOlderMessages = async () => {
+    if (!channelId || !messageCursor || loadingOlder) return;
+    const container = messagesRef.current;
+    const previousHeight = container?.scrollHeight ?? 0;
+    setLoadingOlder(true);
+    try {
+      const data = await api<MessagePage>(
+        `/channels/${channelId}/messages?cursor=${encodeURIComponent(messageCursor)}`,
+      );
+      setMessages((current) => [...data.messages, ...current]);
+      setMessageCursor(data.nextCursor);
+      requestAnimationFrame(() => {
+        if (container) container.scrollTop += container.scrollHeight - previousHeight;
+      });
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
 
   useEffect(() => {
     if (serverId) socket.emit('server:join', serverId);
@@ -374,9 +446,21 @@ export function App() {
       currentUser={user}
       socket={socket}
       initialUsername={dmTarget || undefined}
+      unreadCounts={dmUnread}
+      onConversationRead={(conversationId) => {
+        setDmUnread((current) => {
+          if (!current[conversationId]) return current;
+          const next = { ...current };
+          delete next[conversationId];
+          return next;
+        });
+      }}
+      onActiveConversationChange={setActiveDirectConversationId}
       onBack={() => { setDmTarget(''); setView('chat'); }}
     />
   );
+
+  const totalDmUnread = Object.values(dmUnread).reduce((total, count) => total + count, 0);
 
   return (
     <div className={`app-shell ${showMembers && server ? 'with-members' : ''}`}>
@@ -384,6 +468,7 @@ export function App() {
         <div className="brand-mark">W</div>
         <button className="server-icon dm-icon" onClick={() => setView('dms')} title="Mensagens diretas">
           <MessageCircle size={21} />
+          {totalDmUnread > 0 && <span className="notification-badge">{Math.min(totalDmUnread, 99)}</span>}
         </button>
         {servers.map((item) => (
           <button
@@ -485,12 +570,17 @@ export function App() {
           )
         ) : (
           <>
-            <section className="messages">
+            <section className="messages" ref={messagesRef}>
               <div className="channel-intro">
                 <div><Hash size={30} /></div>
                 <h1>#{channel.name}</h1>
                 <p>{t('welcomeChannel')}</p>
               </div>
+              {messageCursor && (
+                <button className="load-older" disabled={loadingOlder} onClick={loadOlderMessages}>
+                  {loadingOlder ? 'A carregar…' : 'Carregar mensagens anteriores'}
+                </button>
+              )}
               {messages.map((message) => (
                 <MessageRow
                   key={message.id}

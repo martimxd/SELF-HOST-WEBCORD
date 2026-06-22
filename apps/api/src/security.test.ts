@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   directGroupSchema,
+  directNicknameSchema,
   forwardMessageSchema,
   giphySearchSchema,
   initialChangeSchema,
@@ -49,6 +50,12 @@ describe('security contracts', () => {
         usernames: ['alice', 'ALICE'],
       }).success,
     ).toBe(false);
+  });
+
+  it('limits personal DM nicknames', () => {
+    expect(directNicknameSchema.safeParse({ nickname: 'Amigo do trabalho' }).success).toBe(true);
+    expect(directNicknameSchema.safeParse({ nickname: 'A'.repeat(41) }).success).toBe(false);
+    expect(directNicknameSchema.safeParse({ nickname: '' }).success).toBe(true);
   });
 
   it('validates username changes with the public username rules', () => {

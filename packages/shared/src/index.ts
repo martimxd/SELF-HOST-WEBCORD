@@ -105,6 +105,10 @@ export const directGroupMemberSchema = z.object({
   username: usernameSchema,
 });
 
+export const directNicknameSchema = z.object({
+  nickname: z.string().trim().max(40),
+});
+
 export const qualityProfiles = {
   low: { width: 854, height: 480, frameRate: 25, maxBitrate: 1_200_000 },
   medium: { width: 1280, height: 720, frameRate: 30, maxBitrate: 2_500_000 },
