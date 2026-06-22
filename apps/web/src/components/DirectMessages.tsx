@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Ban,
+  Camera,
   Check,
+  DoorOpen,
   Link2,
   Image,
   MessageCircle,
@@ -13,6 +15,7 @@ import {
   Send,
   Search as SearchIcon,
   Sticker,
+  Trash2,
   UserMinus,
   UserPlus,
   UserX,
@@ -21,7 +24,7 @@ import {
   X,
 } from 'lucide-react';
 import type { Socket } from 'socket.io-client';
-import { api, attachmentMessage, copyText, type UploadedFile } from '../api';
+import { API_URL, api, attachmentMessage, copyText, type UploadedFile } from '../api';
 import type {
   DirectConversation,
   FriendsPayload,
@@ -39,9 +42,21 @@ import { SearchPanel } from './SearchPanel';
 
 const emptyFriends: FriendsPayload = { friends: [], incoming: [], outgoing: [], blocked: [] };
 
+function conversationPreview(content?: string | null) {
+  if (!content) return '';
+  const callLog = content.match(
+    /^\[call-log started="([^"]+)" ended="([^"]*)" duration="(\d+)"\]$/,
+  );
+  if (!callLog) return content;
+  return callLog[2] ? 'Chamada terminada' : 'Chamada em curso';
+}
+
 function ConversationAvatar({ conversation }: { conversation: DirectConversation }) {
   if (!conversation.isGroup && conversation.otherUser) {
     return <UserAvatar user={conversation.otherUser} />;
+  }
+  if (conversation.imageUrl) {
+    return <div className="avatar group-avatar has-image"><img src={`${API_URL}${conversation.imageUrl}`} alt={conversation.name} /></div>;
   }
   return <div className="avatar group-avatar"><Users size={18} /></div>;
 }
@@ -54,6 +69,7 @@ export function DirectMessages({
   unreadCounts,
   onConversationRead,
   onActiveConversationChange,
+  embedded = false,
 }: {
   currentUser: User;
   socket: Socket;
@@ -62,6 +78,7 @@ export function DirectMessages({
   unreadCounts: Record<string, number>;
   onConversationRead: (conversationId: string) => void;
   onActiveConversationChange: (conversationId: string) => void;
+  embedded?: boolean;
 }) {
   const [conversations, setConversations] = useState<DirectConversation[]>([]);
   const [friends, setFriends] = useState<FriendsPayload>(emptyFriends);
@@ -197,13 +214,42 @@ export function DirectMessages({
       }
       loadConversations().catch((err) => setError(err.message));
     };
+    const onMessageDeleted = ({
+      conversationId,
+      messageId,
+    }: {
+      conversationId: string;
+      messageId: string;
+    }) => {
+      if (conversationId === selectedId) {
+        setMessages((items) => items.filter((message) => message.id !== messageId));
+      }
+    };
+    const onMessageUpdated = (message: Message) => {
+      if (message.conversationId === selectedId) {
+        setMessages((items) =>
+          items.map((item) => item.id === message.id ? message : item),
+        );
+      }
+      loadConversations().catch((err) => setError(err.message));
+    };
+    const onConversationDeleted = ({ conversationId }: { conversationId: string }) => {
+      if (conversationId === selectedId) setSelectedId('');
+      loadConversations().catch((err) => setError(err.message));
+    };
     socket.on('dm:message:new', onMessage);
     socket.on('dm:conversation:update', onConversationUpdate);
     socket.on('dm:member:removed', onMemberRemoved);
+    socket.on('dm:message:deleted', onMessageDeleted);
+    socket.on('dm:message:updated', onMessageUpdated);
+    socket.on('dm:conversation:deleted', onConversationDeleted);
     return () => {
       socket.off('dm:message:new', onMessage);
       socket.off('dm:conversation:update', onConversationUpdate);
       socket.off('dm:member:removed', onMemberRemoved);
+      socket.off('dm:message:deleted', onMessageDeleted);
+      socket.off('dm:message:updated', onMessageUpdated);
+      socket.off('dm:conversation:deleted', onConversationDeleted);
     };
   }, [selectedId, socket, currentUser.id]);
 
@@ -453,6 +499,18 @@ export function DirectMessages({
     }
   };
 
+  const deleteMessage = async (message: Message) => {
+    if (!selectedId || !confirm('Apagar esta mensagem?')) return;
+    try {
+      await api(`/direct-conversations/${selectedId}/messages/${message.id}`, {
+        method: 'DELETE',
+      });
+      setMessages((items) => items.filter((item) => item.id !== message.id));
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   const upload = async (file: File) => {
     if (!selectedId) return;
     const form = new FormData();
@@ -466,6 +524,39 @@ export function DirectMessages({
         method: 'POST',
         body: JSON.stringify({ content: attachmentMessage(result.upload) }),
       });
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const uploadGroupImage = async (file: File) => {
+    if (!selected?.isGroup) return;
+    const form = new FormData();
+    form.append('file', file);
+    try {
+      const result = await api<{ imageUrl: string }>(
+        `/direct-conversations/${selected.id}/image`,
+        { method: 'POST', body: form },
+      );
+      setConversations((items) =>
+        items.map((item) =>
+          item.id === selected.id ? { ...item, imageUrl: result.imageUrl } : item,
+        ),
+      );
+      setNotice('Imagem do grupo atualizada');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const removeGroupImage = async () => {
+    if (!selected?.isGroup) return;
+    try {
+      await api(`/direct-conversations/${selected.id}/image`, { method: 'DELETE' });
+      setConversations((items) =>
+        items.map((item) => item.id === selected.id ? { ...item, imageUrl: null } : item),
+      );
+      setNotice('Imagem do grupo removida');
     } catch (err) {
       setError((err as Error).message);
     }
@@ -488,9 +579,9 @@ export function DirectMessages({
       : '';
 
   return (
-    <div className={`dm-page ${selected ? 'conversation-selected' : ''}`}>
+    <div className={`dm-page ${selected ? 'conversation-selected' : ''} ${embedded ? 'dm-embedded' : ''}`}>
       <aside className="dm-sidebar">
-        <header><button onClick={onBack}><ArrowLeft /></button><strong>Mensagens</strong></header>
+        <header>{!embedded && <button onClick={onBack}><ArrowLeft /></button>}<strong>Mensagens</strong></header>
         <div className="dm-tabs">
           <button className={section === 'chats' ? 'active' : ''} onClick={() => setSection('chats')}>
             <MessageCircle size={17} /> Conversas
@@ -519,7 +610,7 @@ export function DirectMessages({
                   <ConversationAvatar conversation={conversation} />
                   <div>
                     <strong>{conversation.isGroup ? conversation.name : conversation.nickname || `@${conversation.otherUser?.username}`}</strong>
-                    <small>{conversation.lastMessage?.content || `${conversation.members.length} membro${conversation.members.length === 1 ? '' : 's'}`}</small>
+                    <small>{conversationPreview(conversation.lastMessage?.content) || `${conversation.members.length} membro${conversation.members.length === 1 ? '' : 's'}`}</small>
                   </div>
                   {(unreadCounts[conversation.id] ?? 0) > 0 && (
                     <span className="dm-unread">{Math.min(unreadCounts[conversation.id] ?? 0, 99)}</span>
@@ -588,7 +679,16 @@ export function DirectMessages({
             ))}
           </div>
         )}
-        <div className="dm-current-user"><UserAvatar user={currentUser} /><strong>@{currentUser.username}</strong></div>
+        <div className="dm-current-user">
+          <UserAvatar user={currentUser} />
+          <span>
+            <strong>@{currentUser.username}</strong>
+            <small>{currentUser.status === 'offline' ? 'offline' : 'online'}</small>
+            {currentUser.activeCall && (
+              <small className="active-call-status"><Mic size={11} /> {currentUser.activeCall.label}</small>
+            )}
+          </span>
+        </div>
       </aside>
       <main className="chat-panel">
         {selected ? (
@@ -620,13 +720,27 @@ export function DirectMessages({
               <button className="push-right call-action" onClick={() => setCallMode('audio')} title="Chamada de voz"><Mic /></button>
               <button className="call-action" onClick={() => setCallMode('video')} title="Chamada de vídeo"><Video /></button>
               <button className="call-action" onClick={() => setSearchOpen((current) => !current)} title="Pesquisar"><SearchIcon /></button>
+              {selected.isGroup && (
+                <label className="call-action group-image-action" title="Alterar imagem do grupo">
+                  <Camera />
+                  <input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" onChange={(event) => event.target.files?.[0] && uploadGroupImage(event.target.files[0])} />
+                </label>
+              )}
               {selected.isGroup && <button className="call-action" onClick={() => setDialog('members')} title="Membros"><Users /></button>}
+              {selected.isGroup && (
+                <button className="call-action" onClick={() => removeGroupMember(currentUser.id)} title="Sair do grupo">
+                  <DoorOpen />
+                </button>
+              )}
             </header>
             {callMode ? (
               <CallRoom
                 name={title}
                 tokenEndpoint={`/direct-conversations/${selected.id}/call-token`}
                 videoEnabled={callMode === 'video'}
+                socket={socket}
+                callKind="direct"
+                callTargetId={selected.id}
               />
             ) : (
               <>
@@ -655,6 +769,7 @@ export function DirectMessages({
                           ? selected.nickname
                           : undefined
                       }
+                      onDelete={message.author.id === currentUser.id ? deleteMessage : undefined}
                     />
                   ))}
                 </section>
@@ -717,7 +832,7 @@ export function DirectMessages({
             <span className="eyebrow">GRUPO PRIVADO</span>
             <h2>Cria um grupo</h2>
             <label>Nome do grupo<input required minLength={2} maxLength={80} value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="Equipa do projeto" /></label>
-            <p className="muted">Seleciona entre 2 e 9 amigos. Contigo, o grupo pode ter no máximo 10 membros.</p>
+            <p className="muted">Podes criar o grupo vazio e adicionar até 9 amigos depois.</p>
             <div className="dialog-list selectable">
               {friends.friends.map((friend) => (
                 <button type="button" className={selectedFriends.includes(friend.id) ? 'selected' : ''} key={friend.id} onClick={() => toggleGroupFriend(friend.id)}>
@@ -727,7 +842,7 @@ export function DirectMessages({
                 </button>
               ))}
             </div>
-            <button className="primary" disabled={selectedFriends.length < 2 || selectedFriends.length > 9}>Criar grupo ({selectedFriends.length + 1}/10)</button>
+            <button className="primary" disabled={selectedFriends.length > 9}>Criar grupo ({selectedFriends.length + 1}/10)</button>
           </form>
         </div>
       )}
@@ -738,6 +853,11 @@ export function DirectMessages({
             <button className="modal-close" onClick={() => setDialog(null)}><X /></button>
             <span className="eyebrow">MEMBROS</span>
             <h2>{selected.name}</h2>
+            {selected.imageUrl && (
+              <button className="danger-button group-image-remove" onClick={removeGroupImage}>
+                <Trash2 size={16} /> Remover imagem do grupo
+              </button>
+            )}
             {selected.ownerId === currentUser.id && selected.members.length < 10 && (
               <form className="friend-search" onSubmit={addGroupMember}>
                 <input value={memberUsername} onChange={(event) => setMemberUsername(event.target.value)} placeholder="Adicionar amigo por username" />
@@ -749,7 +869,7 @@ export function DirectMessages({
                 <div className="group-member-row" key={member.id}>
                   <UserAvatar user={member} />
                   <span><strong>@{member.username}</strong><small>{member.status === 'online' ? 'Online' : 'Offline'}{member.id === selected.ownerId ? ' · Criador' : ''}</small></span>
-                  {member.id !== selected.ownerId && (selected.ownerId === currentUser.id || member.id === currentUser.id) && (
+                  {(member.id === currentUser.id || (member.id !== selected.ownerId && selected.ownerId === currentUser.id)) && (
                     <button onClick={() => removeGroupMember(member.id)} title={member.id === currentUser.id ? 'Sair do grupo' : 'Remover membro'}><UserMinus /></button>
                   )}
                 </div>

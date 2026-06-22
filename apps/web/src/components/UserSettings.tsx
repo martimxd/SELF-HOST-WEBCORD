@@ -23,6 +23,8 @@ export function UserSettings({
   const [bio, setBio] = useState(user.bio || '');
   const [customStatus, setCustomStatus] = useState(user.customStatus || '');
   const [notice, setNotice] = useState('');
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deletingAccount, setDeletingAccount] = useState(false);
 
   useEffect(() => () => {
     if (preview) URL.revokeObjectURL(preview);
@@ -70,6 +72,23 @@ export function UserSettings({
       setNotice('Perfil atualizado');
     } catch (err) {
       setError((err as Error).message);
+    }
+  };
+
+  const deleteAccount = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!deletePassword || !confirm('Apagar permanentemente a tua conta? Esta ação não pode ser anulada.')) return;
+    setDeletingAccount(true);
+    setError('');
+    try {
+      await api('/users/me', {
+        method: 'DELETE',
+        body: JSON.stringify({ password: deletePassword }),
+      });
+      await onLogout();
+    } catch (err) {
+      setError((err as Error).message);
+      setDeletingAccount(false);
     }
   };
 
@@ -134,6 +153,27 @@ export function UserSettings({
         <div><h2>Sair da conta</h2><p>Termina a sessão neste dispositivo e volta ao ecrã de login.</p></div>
         <button className="danger-button" onClick={onLogout}><LogOut size={18} /> Terminar sessão</button>
       </section>
+      {!user.isSuperAdmin && (
+        <form className="panel settings-panel delete-account-settings" onSubmit={deleteAccount}>
+          <Trash2 size={34} />
+          <div>
+            <h2>Apagar conta</h2>
+            <p>Os teus dados pessoais serão removidos. Confirma com a tua palavra-passe.</p>
+          </div>
+          <div className="danger-confirm-control">
+            <input
+              type="password"
+              value={deletePassword}
+              onChange={(event) => setDeletePassword(event.target.value)}
+              placeholder="Palavra-passe"
+              autoComplete="current-password"
+            />
+            <button className="danger-button" disabled={!deletePassword || deletingAccount}>
+              <Trash2 size={17} /> {deletingAccount ? 'A apagar…' : 'Apagar conta'}
+            </button>
+          </div>
+        </form>
+      )}
       {error && <div className="form-error settings-error">{error}</div>}
       {notice && <button className="toast success-toast" onClick={() => setNotice('')}>{notice}</button>}
     </div>

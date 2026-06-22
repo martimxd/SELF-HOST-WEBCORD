@@ -12,6 +12,7 @@ import {
   updateUsernameSchema,
 } from '@webcord/shared';
 import { requireSuperAdmin } from './permissions.js';
+import { contentCategory } from './search.js';
 
 describe('security contracts', () => {
   it('rejects weak passwords', () => {
@@ -56,6 +57,22 @@ describe('security contracts', () => {
     expect(directNicknameSchema.safeParse({ nickname: 'Amigo do trabalho' }).success).toBe(true);
     expect(directNicknameSchema.safeParse({ nickname: 'A'.repeat(41) }).success).toBe(false);
     expect(directNicknameSchema.safeParse({ nickname: '' }).success).toBe(true);
+  });
+
+  it('allows private groups with no preselected friends', () => {
+    expect(directGroupSchema.safeParse({ name: 'Notas', usernames: [] }).success).toBe(true);
+  });
+
+  it('classifies uploaded images and videos by their encoded MIME type', () => {
+    expect(contentCategory(
+      '[attachment name="foto.png" type="image%2Fpng" size="120"]\nhttps://example.test/file',
+    )).toBe('images');
+    expect(contentCategory(
+      '[attachment name="clip.webm" type="video%2Fwebm" size="240"]\nhttps://example.test/file',
+    )).toBe('videos');
+    expect(contentCategory(
+      '[attachment name="relatorio.pdf" type="application%2Fpdf" size="360"]\nhttps://example.test/file',
+    )).toBe('files');
   });
 
   it('validates username changes with the public username rules', () => {

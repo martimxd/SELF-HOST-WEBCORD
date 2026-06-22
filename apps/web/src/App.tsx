@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import {
+  Ban,
   Camera,
+  Crown,
+  DoorOpen,
   Hash,
   Image,
   Link2,
@@ -16,8 +19,10 @@ import {
   Shield,
   Sticker,
   Trash2,
+  UserCog,
   Users,
   Video,
+  X,
 } from 'lucide-react';
 import { API_URL, api, attachmentMessage, copyText, type UploadedFile } from './api';
 import type { Channel, Message, MessagePage, Server, User } from './types';
@@ -42,6 +47,48 @@ const socket = io(import.meta.env.VITE_SOCKET_URL || window.location.origin, {
   autoConnect: false,
   withCredentials: true,
 });
+const roleRank: Record<string, number> = { MEMBER: 0, MODERATOR: 1, ADMIN: 2, OWNER: 3 };
+
+function ServerRail({
+  servers,
+  serverId,
+  totalDmUnread,
+  onDms,
+  onSelect,
+  onCreate,
+}: {
+  servers: Server[];
+  serverId: string;
+  totalDmUnread: number;
+  onDms: () => void;
+  onSelect: (server: Server) => void;
+  onCreate: () => void;
+}) {
+  return (
+    <aside className="server-rail">
+      <div className="brand-mark">W</div>
+      <button className="server-icon dm-icon" onClick={onDms} title="Mensagens diretas">
+        <MessageCircle size={21} />
+        {totalDmUnread > 0 && <span className="notification-badge">{Math.min(totalDmUnread, 99)}</span>}
+      </button>
+      {servers.map((item) => (
+        <button
+          className={`server-icon ${item.id === serverId ? 'active' : ''}`}
+          key={item.id}
+          title={item.name}
+          onClick={() => onSelect(item)}
+        >
+          {item.imageUrl
+            ? <img className="server-icon-image" src={`${API_URL}${item.imageUrl}`} alt={item.name} />
+            : item.name.slice(0, 2).toUpperCase()}
+        </button>
+      ))}
+      <button className="server-icon add" onClick={onCreate} title="Criar servidor">
+        <Plus size={20} />
+      </button>
+    </aside>
+  );
+}
 
 export function App() {
   const { t } = useI18n();
@@ -66,6 +113,10 @@ export function App() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [dmUnread, setDmUnread] = useState<Record<string, number>>({});
   const [activeDirectConversationId, setActiveDirectConversationId] = useState('');
+  const [serverManagementOpen, setServerManagementOpen] = useState(false);
+  const [serverDeletePassword, setServerDeletePassword] = useState('');
+  const [ownershipPassword, setOwnershipPassword] = useState('');
+  const [ownershipTargetId, setOwnershipTargetId] = useState('');
   const messagesRef = useRef<HTMLElement>(null);
   const registrationToken = new URLSearchParams(window.location.search).get('register');
 
@@ -75,17 +126,25 @@ export function App() {
   const canCreateChannels = Boolean(
     membership && ['OWNER', 'ADMIN', 'MODERATOR'].includes(membership.role),
   );
+  const isServerOwner = membership?.role === 'OWNER';
+  const canCustomizeServer = Boolean(membership && ['OWNER', 'ADMIN'].includes(membership.role));
 
   const loadServers = useCallback(async () => {
     const result = await api<{ servers: Server[] }>('/servers');
     setServers(result.servers);
     const firstServer = result.servers[0];
     setServerId((current) => {
-      if (!current && firstServer) {
-        setChannelId(firstServer.channels[0]?.id || '');
-        return firstServer.id;
+      const currentServer = result.servers.find((item) => item.id === current);
+      if (currentServer) {
+        setChannelId((currentChannel) =>
+          currentServer.channels.some((item) => item.id === currentChannel)
+            ? currentChannel
+            : currentServer.channels[0]?.id || '',
+        );
+        return current;
       }
-      return current;
+      setChannelId(firstServer?.channels[0]?.id || '');
+      return firstServer?.id || '';
     });
     return result.servers;
   }, []);
@@ -216,17 +275,52 @@ export function App() {
         current.map((item) => item.id === updatedServerId ? { ...item, imageUrl } : item),
       );
     };
+    const onCallUpdate = ({
+      userId,
+      activeCall,
+    }: {
+      userId: string;
+      activeCall: User['activeCall'];
+    }) => {
+      setUser((current) => current?.id === userId ? { ...current, activeCall } : current);
+      setServers((current) =>
+        current.map((item) => ({
+          ...item,
+          members: item.members.map((member) =>
+            member.user.id === userId
+              ? { ...member, user: { ...member.user, activeCall } }
+              : member,
+          ),
+        })),
+      );
+    };
+    const refreshServers = () => loadServers().catch((err) => setError(err.message));
+    const onServerRemoved = ({ serverId: removedId }: { serverId: string }) => {
+      setServerManagementOpen(false);
+      refreshServers();
+      if (removedId === serverId) setView('chat');
+    };
     socket.on('presence:update', onPresence);
     socket.on('user:update', onUserUpdate);
     socket.on('server:member:update', onServerMemberUpdate);
     socket.on('server:update', onServerUpdate);
+    socket.on('user:call:update', onCallUpdate);
+    socket.on('channel:created', refreshServers);
+    socket.on('channel:deleted', refreshServers);
+    socket.on('server:deleted', onServerRemoved);
+    socket.on('server:banned', onServerRemoved);
     return () => {
       socket.off('presence:update', onPresence);
       socket.off('user:update', onUserUpdate);
       socket.off('server:member:update', onServerMemberUpdate);
       socket.off('server:update', onServerUpdate);
+      socket.off('user:call:update', onCallUpdate);
+      socket.off('channel:created', refreshServers);
+      socket.off('channel:deleted', refreshServers);
+      socket.off('server:deleted', onServerRemoved);
+      socket.off('server:banned', onServerRemoved);
     };
-  }, [loadServers]);
+  }, [loadServers, serverId]);
 
   useEffect(() => {
     if (!channelId || channel?.type !== 'TEXT') {
@@ -261,9 +355,22 @@ export function App() {
         }
       }
     };
+    const onMessageDeleted = ({
+      channelId: deletedChannelId,
+      messageId,
+    }: {
+      channelId: string;
+      messageId: string;
+    }) => {
+      if (deletedChannelId === channelId) {
+        setMessages((current) => current.filter((message) => message.id !== messageId));
+      }
+    };
     socket.on('message:new', onMessage);
+    socket.on('message:deleted', onMessageDeleted);
     return () => {
       socket.off('message:new', onMessage);
+      socket.off('message:deleted', onMessageDeleted);
     };
   }, [channelId, channel?.type]);
 
@@ -370,6 +477,114 @@ export function App() {
     );
   };
 
+  const deleteChannel = async (target: Channel) => {
+    if (!confirm(`Apagar o canal #${target.name}?`)) return;
+    try {
+      await api(`/channels/${target.id}`, { method: 'DELETE' });
+      await loadServers();
+      setNotice('Canal apagado');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const deleteMessage = async (message: Message) => {
+    if (!channel || !confirm('Apagar esta mensagem?')) return;
+    try {
+      await api(`/channels/${channel.id}/messages/${message.id}`, { method: 'DELETE' });
+      setMessages((current) => current.filter((item) => item.id !== message.id));
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const updateMemberRole = async (userId: string, role: string) => {
+    if (!server) return;
+    try {
+      await api(`/servers/${server.id}/members/${userId}/role`, {
+        method: 'PUT',
+        body: JSON.stringify({ role }),
+      });
+      await loadServers();
+      setNotice('Cargo atualizado');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const banMember = async (userId: string, username: string) => {
+    if (!server || !confirm(`Banir @${username} deste servidor?`)) return;
+    try {
+      await api(`/servers/${server.id}/members/${userId}`, { method: 'DELETE' });
+      await loadServers();
+      setNotice('Membro banido');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const unbanMember = async (userId: string) => {
+    if (!server) return;
+    try {
+      await api(`/servers/${server.id}/bans/${userId}`, { method: 'DELETE' });
+      await loadServers();
+      setNotice('Ban removido');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const leaveServer = async () => {
+    if (!server || !confirm(`Sair do servidor ${server.name}?`)) return;
+    try {
+      await api(`/servers/${server.id}/members/me`, { method: 'DELETE' });
+      setServerManagementOpen(false);
+      await loadServers();
+      setNotice('Saíste do servidor');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const deleteServer = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!server || !serverDeletePassword) return;
+    if (!confirm(`Apagar definitivamente o servidor ${server.name}?`)) return;
+    try {
+      await api(`/servers/${server.id}`, {
+        method: 'DELETE',
+        body: JSON.stringify({ password: serverDeletePassword }),
+      });
+      setServerDeletePassword('');
+      setServerManagementOpen(false);
+      await loadServers();
+      setNotice('Servidor apagado');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const transferOwnership = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!server || !ownershipTargetId || !ownershipPassword) return;
+    if (!confirm('Transferir a posse deste servidor? Tu passarás a administrador.')) return;
+    try {
+      await api(`/servers/${server.id}/transfer-ownership`, {
+        method: 'POST',
+        body: JSON.stringify({
+          userId: ownershipTargetId,
+          password: ownershipPassword,
+        }),
+      });
+      setOwnershipPassword('');
+      setOwnershipTargetId('');
+      await loadServers();
+      setNotice('Posse do servidor transferida');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   const showProfile = async (username: string, serverJoinedAt?: string) => {
     try {
       const result = await api<{ user: User }>(
@@ -429,6 +644,12 @@ export function App() {
     () => (server?.name || 'W').split(/\s+/).map((part) => part[0]).join('').slice(0, 2),
     [server?.name],
   );
+  const totalDmUnread = Object.values(dmUnread).reduce((total, count) => total + count, 0);
+  const selectServer = (item: Server) => {
+    setServerId(item.id);
+    setChannelId(item.channels[0]?.id || '');
+    setView('chat');
+  };
 
   if (registrationToken && !user) {
     return <RegisterInvite token={registrationToken} onRegistered={setUser} />;
@@ -442,53 +663,45 @@ export function App() {
     <CreateServer onBack={() => setView('chat')} onCreated={serverCreated} />
   );
   if (view === 'dms') return (
-    <DirectMessages
-      currentUser={user}
-      socket={socket}
-      initialUsername={dmTarget || undefined}
-      unreadCounts={dmUnread}
-      onConversationRead={(conversationId) => {
-        setDmUnread((current) => {
-          if (!current[conversationId]) return current;
-          const next = { ...current };
-          delete next[conversationId];
-          return next;
-        });
-      }}
-      onActiveConversationChange={setActiveDirectConversationId}
-      onBack={() => { setDmTarget(''); setView('chat'); }}
-    />
+    <div className="app-shell dm-shell">
+      <ServerRail
+        servers={servers}
+        serverId=""
+        totalDmUnread={totalDmUnread}
+        onDms={() => undefined}
+        onSelect={selectServer}
+        onCreate={() => setView('create-server')}
+      />
+      <DirectMessages
+        currentUser={user}
+        socket={socket}
+        initialUsername={dmTarget || undefined}
+        unreadCounts={dmUnread}
+        onConversationRead={(conversationId) => {
+          setDmUnread((current) => {
+            if (!current[conversationId]) return current;
+            const next = { ...current };
+            delete next[conversationId];
+            return next;
+          });
+        }}
+        onActiveConversationChange={setActiveDirectConversationId}
+        onBack={() => { setDmTarget(''); setView('chat'); }}
+        embedded
+      />
+    </div>
   );
-
-  const totalDmUnread = Object.values(dmUnread).reduce((total, count) => total + count, 0);
 
   return (
     <div className={`app-shell ${showMembers && server ? 'with-members' : ''}`}>
-      <aside className="server-rail">
-        <div className="brand-mark">W</div>
-        <button className="server-icon dm-icon" onClick={() => setView('dms')} title="Mensagens diretas">
-          <MessageCircle size={21} />
-          {totalDmUnread > 0 && <span className="notification-badge">{Math.min(totalDmUnread, 99)}</span>}
-        </button>
-        {servers.map((item) => (
-          <button
-            className={`server-icon ${item.id === serverId ? 'active' : ''}`}
-            key={item.id}
-            title={item.name}
-            onClick={() => {
-              setServerId(item.id);
-              setChannelId(item.channels[0]?.id || '');
-            }}
-          >
-            {item.imageUrl
-              ? <img className="server-icon-image" src={`${API_URL}${item.imageUrl}`} alt={item.name} />
-              : item.name.slice(0, 2).toUpperCase()}
-          </button>
-        ))}
-        <button className="server-icon add" onClick={() => setView('create-server')} title="Criar servidor">
-          <Plus size={20} />
-        </button>
-      </aside>
+      <ServerRail
+        servers={servers}
+        serverId={serverId}
+        totalDmUnread={totalDmUnread}
+        onDms={() => setView('dms')}
+        onSelect={selectServer}
+        onCreate={() => setView('create-server')}
+      />
 
       <aside className={`channel-panel ${mobileOpen ? 'mobile-open' : ''}`}>
         <header>
@@ -502,8 +715,13 @@ export function App() {
             <small>{server?.description || t('communitySpace')}</small>
           </div>
           {server && <button className="server-invite-button" onClick={copyServerInvite} title="Copiar link de convite"><Link2 size={17} /></button>}
+          {server && membership && (
+            <button className="server-invite-button" onClick={() => setServerManagementOpen(true)} title="Gerir servidor">
+              <UserCog size={17} />
+            </button>
+          )}
         </header>
-        {server && canCreateChannels && (
+        {server && canCustomizeServer && (
           <div className="server-image-actions">
             <label title="Alterar imagem do servidor"><Camera size={15} /> Imagem<input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" onChange={(event) => event.target.files?.[0] && uploadServerImage(event.target.files[0])} /></label>
             {server.imageUrl && <button title="Remover imagem do servidor" onClick={removeServerImage}><Trash2 size={15} /></button>}
@@ -521,22 +739,32 @@ export function App() {
         </div>
         <nav>
           {server?.channels.map((item) => (
-            <button
-              key={item.id}
-              className={item.id === channelId ? 'active' : ''}
-              onClick={() => {
-                setChannelId(item.id);
-                setMobileOpen(false);
-              }}
-            >
-              {item.type === 'TEXT' ? <Hash size={18} /> : item.type === 'VIDEO' ? <Video size={18} /> : <Mic size={18} />}
-              {item.name}
-            </button>
+            <div className="channel-row" key={item.id}>
+              <button
+                className={item.id === channelId ? 'active' : ''}
+                onClick={() => {
+                  setChannelId(item.id);
+                  setMobileOpen(false);
+                }}
+              >
+                {item.type === 'TEXT' ? <Hash size={18} /> : item.type === 'VIDEO' ? <Video size={18} /> : <Mic size={18} />}
+                <span>{item.name}</span>
+              </button>
+              {canCreateChannels && (
+                <button className="channel-delete" onClick={() => deleteChannel(item)} title="Apagar canal">
+                  <Trash2 size={14} />
+                </button>
+              )}
+            </div>
           ))}
         </nav>
         <div className="user-dock">
           <button className="avatar-button" onClick={() => showProfile(user.username)}><UserAvatar user={user} /></button>
-          <div><button className="username-button" onClick={() => showProfile(user.username)}><strong>{user.username}</strong></button><small>{user.status === 'offline' ? 'offline' : 'online'}</small></div>
+          <div>
+            <button className="username-button" onClick={() => showProfile(user.username)}><strong>{user.username}</strong></button>
+            <small>{user.status === 'offline' ? 'offline' : 'online'}</small>
+            {user.activeCall && <small className="active-call-status"><Mic size={11} /> {user.activeCall.label}</small>}
+          </div>
           {user.isSuperAdmin && <button title="Administração" onClick={() => setView('admin')}><Shield size={17} /></button>}
           <button title={t('settings')} onClick={() => setView('settings')}><Settings size={17} /></button>
           <button title={t('logout')} onClick={logout}><LogOut size={17} /></button>
@@ -566,6 +794,9 @@ export function App() {
               name={channel.name}
               tokenEndpoint={`/channels/${channel.id}/call-token`}
               videoEnabled={channel.type === 'VIDEO'}
+              socket={socket}
+              callKind="server"
+              callTargetId={channel.id}
             />
           )
         ) : (
@@ -588,6 +819,11 @@ export function App() {
                   onReply={setReplyingTo}
                   onForward={setForwardingMessage}
                   onProfile={(author) => showProfile(author.username)}
+                  onDelete={
+                    message.author.id === user.id || canCreateChannels
+                      ? deleteMessage
+                      : undefined
+                  }
                 />
               ))}
             </section>
@@ -641,6 +877,7 @@ export function App() {
                   <span>
                     <strong>@{member.user.username}</strong>
                     <small>{member.user.status === 'online' ? 'Online' : 'Offline'} · {member.role.toLowerCase()}</small>
+                    {member.user.activeCall && <small className="active-call-status"><Mic size={11} /> {member.user.activeCall.label}</small>}
                   </span>
                 </button>
               ))}
@@ -677,6 +914,105 @@ export function App() {
           onClose={() => setForwardingMessage(null)}
           onForwarded={() => setNotice('Mensagem reencaminhada')}
         />
+      )}
+      {serverManagementOpen && server && membership && (
+        <div className="modal-backdrop" onClick={() => setServerManagementOpen(false)}>
+          <section className="dialog-card server-management-dialog" onClick={(event) => event.stopPropagation()}>
+            <button className="modal-close" onClick={() => setServerManagementOpen(false)}><X /></button>
+            <span className="eyebrow">GESTÃO DO SERVIDOR</span>
+            <h2>{server.name}</h2>
+            <p className="muted">O teu cargo: {membership.role.toLowerCase()}</p>
+
+            {canCreateChannels && (
+              <>
+                <h3>Membros e cargos</h3>
+                <div className="server-member-management">
+                  {server.members.map((member) => (
+                    <div className="managed-member-row" key={member.id}>
+                      <UserAvatar user={member.user} />
+                      <span>
+                        <strong>@{member.user.username}</strong>
+                        <small>{member.role.toLowerCase()}</small>
+                      </span>
+                      {isServerOwner && member.user.id !== user.id ? (
+                        <select
+                          value={member.role}
+                          onChange={(event) => updateMemberRole(member.user.id, event.target.value)}
+                        >
+                          <option value="ADMIN">Administrador</option>
+                          <option value="MODERATOR">Moderador</option>
+                          <option value="MEMBER">Membro</option>
+                        </select>
+                      ) : <em>{member.role === 'OWNER' ? <Crown size={16} /> : member.role}</em>}
+                      {member.user.id !== user.id
+                        && member.role !== 'OWNER'
+                        && (roleRank[membership.role] ?? -1) > (roleRank[member.role] ?? -1) && (
+                        <button
+                          className="danger-icon-button"
+                          onClick={() => banMember(member.user.id, member.user.username)}
+                          title="Banir membro"
+                        >
+                          <Ban size={17} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                {(server.bans?.length ?? 0) > 0 && (
+                  <>
+                    <h3>Utilizadores banidos</h3>
+                    <div className="server-member-management">
+                      {server.bans?.map((ban) => (
+                        <div className="managed-member-row" key={ban.id}>
+                          <UserAvatar user={ban.user} />
+                          <span><strong>@{ban.user.username}</strong><small>Banido</small></span>
+                          <button className="secondary-button" onClick={() => unbanMember(ban.user.id)}>Desbanir</button>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+
+            {isServerOwner ? (
+              <>
+                <h3>Transferir posse</h3>
+                <form className="management-form" onSubmit={transferOwnership}>
+                  <select value={ownershipTargetId} onChange={(event) => setOwnershipTargetId(event.target.value)} required>
+                    <option value="">Escolher membro</option>
+                    {server.members
+                      .filter((member) => member.user.id !== user.id)
+                      .map((member) => <option key={member.id} value={member.user.id}>@{member.user.username}</option>)}
+                  </select>
+                  <input
+                    type="password"
+                    value={ownershipPassword}
+                    onChange={(event) => setOwnershipPassword(event.target.value)}
+                    placeholder="A tua palavra-passe"
+                    required
+                  />
+                  <button className="secondary-button"><Crown size={16} /> Transferir posse</button>
+                </form>
+                <h3>Apagar servidor</h3>
+                <form className="management-form danger-zone" onSubmit={deleteServer}>
+                  <input
+                    type="password"
+                    value={serverDeletePassword}
+                    onChange={(event) => setServerDeletePassword(event.target.value)}
+                    placeholder="A tua palavra-passe"
+                    required
+                  />
+                  <button className="danger-button"><Trash2 size={16} /> Apagar definitivamente</button>
+                </form>
+              </>
+            ) : (
+              <button className="danger-button leave-server-button" onClick={leaveServer}>
+                <DoorOpen size={17} /> Sair do servidor
+              </button>
+            )}
+          </section>
+        </div>
       )}
     </div>
   );

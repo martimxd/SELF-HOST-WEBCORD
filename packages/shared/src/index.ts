@@ -94,7 +94,6 @@ export const directGroupSchema = z.object({
   name: z.string().trim().min(2).max(80),
   usernames: z
     .array(usernameSchema)
-    .min(2, 'Escolha pelo menos duas pessoas')
     .max(9, 'Um grupo pode ter no máximo 10 membros')
     .refine((usernames) => new Set(usernames.map((username) => username.toLowerCase())).size === usernames.length, {
       message: 'Não repita usernames',
@@ -107,6 +106,19 @@ export const directGroupMemberSchema = z.object({
 
 export const directNicknameSchema = z.object({
   nickname: z.string().trim().max(40),
+});
+
+export const passwordConfirmationSchema = z.object({
+  password: z.string().min(1).max(256),
+});
+
+export const serverRoleSchema = z.object({
+  role: z.enum(['ADMIN', 'MODERATOR', 'MEMBER']),
+});
+
+export const ownershipTransferSchema = z.object({
+  userId: z.string().min(1),
+  password: z.string().min(1).max(256),
 });
 
 export const qualityProfiles = {

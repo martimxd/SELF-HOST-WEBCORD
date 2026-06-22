@@ -10,23 +10,31 @@ export type User = {
   presenceMode?: 'ONLINE' | 'INVISIBLE';
   bio?: string;
   customStatus?: string;
+  activeCall?: {
+    label: string;
+    kind: 'server' | 'direct';
+    targetId: string;
+  } | null;
   relationship?: 'self' | 'friend' | 'pending' | 'none' | 'blocked';
   serverJoinedAt?: string;
 };
 
 export type Channel = {
   id: string;
+  serverId?: string;
   name: string;
   type: 'TEXT' | 'VOICE' | 'VIDEO';
 };
 
 export type Server = {
   id: string;
+  ownerId: string;
   name: string;
   description: string;
   imageUrl?: string | null;
   channels: Channel[];
   members: Array<{ id: string; role: string; joinedAt: string; user: User }>;
+  bans?: Array<{ id: string; createdAt: string; user: User }>;
 };
 
 export type Message = {
@@ -52,6 +60,7 @@ export type DirectConversation = {
   members: Array<Pick<User, 'id' | 'username' | 'createdAt' | 'avatarUrl' | 'status'>>;
   otherUser: Pick<User, 'id' | 'username' | 'createdAt' | 'avatarUrl' | 'status'> | null;
   nickname: string | null;
+  imageUrl: string | null;
   lastMessage: { content: string; createdAt: string } | null;
   updatedAt: string;
 };

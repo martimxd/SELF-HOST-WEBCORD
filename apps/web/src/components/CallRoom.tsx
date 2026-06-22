@@ -1,15 +1,17 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
-  ControlBar,
+  DisconnectButton,
   LayoutContextProvider,
   LiveKitRoom,
   ParticipantTile,
   RoomAudioRenderer,
+  TrackToggle,
   VideoTrack,
   useTracks,
 } from '@livekit/components-react';
-import { Mic, MicOff, MonitorUp, Video } from 'lucide-react';
+import { Mic, MicOff, MonitorUp, PhoneOff, Video } from 'lucide-react';
 import { Track } from 'livekit-client';
+import type { Socket } from 'socket.io-client';
 import { api } from '../api';
 import { qualityProfiles, type QualityProfile } from '@webcord/shared';
 
@@ -17,6 +19,9 @@ type CallRoomProps = {
   name: string;
   tokenEndpoint: string;
   videoEnabled: boolean;
+  socket: Socket;
+  callKind: 'server' | 'direct';
+  callTargetId: string;
 };
 
 function CallStage() {
@@ -68,21 +73,33 @@ function CallStage() {
         })}
       </div>
       <div className="call-controls">
-        <ControlBar
-          variation="minimal"
-          controls={{ microphone: true, camera: true, screenShare: true, chat: false, leave: true, settings: true }}
-        />
+        <div className="custom-call-controls">
+          <TrackToggle source={Track.Source.Microphone} title="Ligar ou desligar microfone" />
+          <TrackToggle source={Track.Source.Camera} title="Ligar ou desligar câmara" />
+          <TrackToggle source={Track.Source.ScreenShare} title="Partilhar ecrã" />
+          <DisconnectButton className="lk-disconnect-button" title="Sair da chamada">
+            <PhoneOff size={19} />
+          </DisconnectButton>
+        </div>
       </div>
       <RoomAudioRenderer />
     </div>
   );
 }
 
-export function CallRoom({ name, tokenEndpoint, videoEnabled }: CallRoomProps) {
+export function CallRoom({
+  name,
+  tokenEndpoint,
+  videoEnabled,
+  socket,
+  callKind,
+  callTargetId,
+}: CallRoomProps) {
   const [token, setToken] = useState('');
   const [quality, setQuality] = useState<QualityProfile>('medium');
   const [error, setError] = useState('');
   const [joining, setJoining] = useState(false);
+  const [connected, setConnected] = useState(false);
   const livekitUrl = import.meta.env.VITE_LIVEKIT_URL
     || `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/livekit`;
 
@@ -102,6 +119,10 @@ export function CallRoom({ name, tokenEndpoint, videoEnabled }: CallRoomProps) {
       setJoining(false);
     }
   };
+
+  useEffect(() => () => {
+    if (connected) socket.emit('call:leave');
+  }, [connected, socket]);
 
   if (!token) {
     return (
@@ -140,7 +161,19 @@ export function CallRoom({ name, tokenEndpoint, videoEnabled }: CallRoomProps) {
           },
         } : false}
         audio
-        onDisconnected={() => setToken('')}
+        onConnected={() => {
+          setConnected(true);
+          socket.emit('call:join', {
+            label: name,
+            kind: callKind,
+            targetId: callTargetId,
+          });
+        }}
+        onDisconnected={() => {
+          setConnected(false);
+          socket.emit('call:leave');
+          setToken('');
+        }}
         onError={(roomError) => {
           setError(roomError.message || 'Não foi possível ligar à chamada.');
           setToken('');

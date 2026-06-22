@@ -26,7 +26,10 @@ import {
   initialChangeSchema,
   loginSchema,
   messageSchema,
+  passwordConfirmationSchema,
+  ownershipTransferSchema,
   registrationInviteSchema,
+  serverRoleSchema,
   serverSchema,
   updateProfileSchema,
 } from '@webcord/shared';
@@ -39,6 +42,7 @@ import {
   signSession,
 } from './auth.js';
 import { requireSuperAdmin } from './permissions.js';
+import { matchesSearchCategory } from './search.js';
 
 const app = Fastify({ logger: true, bodyLimit: 2 * 1024 ** 3, trustProxy: true });
 await app.register(cors, {
@@ -55,6 +59,13 @@ await app.register(multipart, {
 
 fs.mkdirSync(config.UPLOAD_DIR, { recursive: true });
 const onlineUsers = new Map<string, number>();
+const activeCalls = new Map<string, { label: string; kind: 'server' | 'direct'; targetId: string }>();
+const directCallSessions = new Map<string, {
+  messageId: string;
+  startedAt: Date;
+  initiatorId: string;
+  participants: Set<string>;
+}>();
 
 function sessionCookieOptions(request: FastifyRequest) {
   return {
@@ -111,6 +122,7 @@ function publicUser(user: {
     presenceMode: user.presenceMode ?? 'ONLINE',
     bio: deleted ? '' : user.bio ?? '',
     customStatus: deleted ? '' : user.customStatus ?? '',
+    activeCall: activeCalls.get(user.id) ?? null,
     status:
       user.presenceMode === 'INVISIBLE' || !onlineUsers.has(user.id) ? 'offline' : 'online',
   };
@@ -118,6 +130,66 @@ function publicUser(user: {
 
 function displayUsername(username: string) {
   return username.startsWith('deleted-') ? 'Deleted User' : username;
+}
+
+function callLogContent(startedAt: Date, endedAt?: Date) {
+  const durationSeconds = endedAt
+    ? Math.max(0, Math.round((endedAt.getTime() - startedAt.getTime()) / 1000))
+    : 0;
+  return `[call-log started="${startedAt.toISOString()}" ended="${endedAt?.toISOString() || ''}" duration="${durationSeconds}"]`;
+}
+
+async function serializeDirectMessage(messageId: string) {
+  const message = await prisma.directMessage.findUnique({
+    where: { id: messageId },
+    include: {
+      author: {
+        select: {
+          id: true,
+          username: true,
+          avatarStoredName: true,
+          presenceMode: true,
+        },
+      },
+      replyTo: {
+        include: {
+          author: {
+            select: { id: true, username: true, avatarStoredName: true },
+          },
+        },
+      },
+    },
+  });
+  if (!message) return null;
+  return {
+    ...message,
+    replyTo: serializeReply(message.replyTo),
+    author: publicUser({
+      ...message.author,
+      isSuperAdmin: false,
+      mustChangePassword: false,
+      suspended: false,
+    }),
+  };
+}
+
+async function leaveTrackedCall(userId: string) {
+  const call = activeCalls.get(userId);
+  activeCalls.delete(userId);
+  io.emit('user:call:update', { userId, activeCall: null });
+  if (call?.kind !== 'direct') return;
+  const session = directCallSessions.get(call.targetId);
+  if (!session) return;
+  session.participants.delete(userId);
+  if (session.participants.size > 0) return;
+  directCallSessions.delete(call.targetId);
+  const endedAt = new Date();
+  await prisma.directMessage.update({
+    where: { id: session.messageId },
+    data: { content: callLogContent(session.startedAt, endedAt), editedAt: endedAt },
+  });
+  const updated = await serializeDirectMessage(session.messageId);
+  if (updated) io.to(`dm:${call.targetId}`).emit('dm:message:updated', updated);
 }
 
 async function isMember(userId: string, serverId: string) {
@@ -129,6 +201,122 @@ async function isMember(userId: string, serverId: string) {
 async function canManage(userId: string, serverId: string) {
   const member = await isMember(userId, serverId);
   return member && ['OWNER', 'ADMIN', 'MODERATOR'].includes(member.role);
+}
+
+async function canCustomizeServer(userId: string, serverId: string) {
+  const member = await isMember(userId, serverId);
+  return member && ['OWNER', 'ADMIN'].includes(member.role);
+}
+
+const roleRank: Record<string, number> = {
+  MEMBER: 0,
+  MODERATOR: 1,
+  ADMIN: 2,
+  OWNER: 3,
+};
+
+async function verifyPassword(userId: string, password: string) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { passwordHash: true },
+  });
+  return Boolean(user && await argon2.verify(user.passwordHash, password));
+}
+
+async function anonymizeUser(userId: string) {
+  const target = await prisma.user.findUnique({ where: { id: userId } });
+  if (!target) return null;
+  const [ownedServers, ownedGroups] = await Promise.all([
+    prisma.server.findMany({
+      where: { ownerId: userId },
+      include: {
+        members: {
+          where: { userId: { not: userId } },
+          orderBy: { joinedAt: 'asc' },
+        },
+      },
+    }),
+    prisma.directConversation.findMany({
+      where: { ownerId: userId, isGroup: true },
+      include: {
+        members: {
+          where: { userId: { not: userId } },
+          orderBy: { joinedAt: 'asc' },
+        },
+      },
+    }),
+  ]);
+  await prisma.$transaction(async (transaction) => {
+    for (const server of ownedServers) {
+      const successor = server.members[0];
+      if (!successor) {
+        await transaction.server.delete({ where: { id: server.id } });
+        continue;
+      }
+      await transaction.server.update({
+        where: { id: server.id },
+        data: { ownerId: successor.userId },
+      });
+      await transaction.serverMember.update({
+        where: { userId_serverId: { userId: successor.userId, serverId: server.id } },
+        data: { role: 'OWNER' },
+      });
+    }
+    for (const group of ownedGroups) {
+      const successor = group.members[0];
+      if (!successor) {
+        await transaction.directConversation.delete({ where: { id: group.id } });
+        continue;
+      }
+      await transaction.directConversation.update({
+        where: { id: group.id },
+        data: { ownerId: successor.userId },
+      });
+    }
+    await transaction.serverMember.deleteMany({ where: { userId } });
+    await transaction.directConversationMember.deleteMany({
+      where: {
+        userId,
+        conversation: { isGroup: true },
+      },
+    });
+    await transaction.serverBan.deleteMany({ where: { userId } });
+    await transaction.user.update({
+      where: { id: userId },
+      data: {
+        username: `deleted-${userId}`,
+        passwordHash: await argon2.hash(randomBytes(32).toString('hex')),
+        avatarStoredName: null,
+        bio: '',
+        customStatus: '',
+        presenceMode: 'INVISIBLE',
+        suspended: true,
+        isSuperAdmin: false,
+        deletedAt: new Date(),
+      },
+    });
+    await transaction.friendship.deleteMany({
+      where: { OR: [{ requesterId: userId }, { addresseeId: userId }] },
+    });
+    await transaction.userBlock.deleteMany({
+      where: { OR: [{ blockerId: userId }, { blockedId: userId }] },
+    });
+    await transaction.friendInvite.deleteMany({ where: { ownerId: userId } });
+  });
+  if (target.avatarStoredName) {
+    fs.rmSync(path.join(config.UPLOAD_DIR, 'avatars', target.avatarStoredName), { force: true });
+  }
+  activeCalls.delete(userId);
+  io.emit('user:update', {
+    id: userId,
+    username: 'Deleted User',
+    avatarUrl: null,
+    bio: '',
+    customStatus: '',
+    activeCall: null,
+    status: 'offline',
+  });
+  return target;
 }
 
 async function getDirectConversation(userId: string, conversationId: string) {
@@ -172,6 +360,7 @@ function serializeDirectConversation(
   conversation: {
     id: string;
     name: string | null;
+    imageStoredName?: string | null;
     isGroup: boolean;
     ownerId: string | null;
     updatedAt: Date;
@@ -205,6 +394,9 @@ function serializeDirectConversation(
   return {
     id: conversation.id,
     name: conversation.isGroup ? conversation.name : otherUser?.username,
+    imageUrl: conversation.isGroup && conversation.imageStoredName
+      ? `/direct-group-images/${conversation.imageStoredName}`
+      : null,
     isGroup: conversation.isGroup,
     ownerId: conversation.ownerId,
     members,
@@ -296,25 +488,6 @@ function normalizeGiphyItem(item: GiphyItem) {
     height: Number(rendition.height || 0),
     analyticsOnSend: item.analytics?.onsent?.url || '',
   };
-}
-
-function contentCategory(content: string) {
-  const value = content.toLowerCase();
-  if (/\.(png|jpe?g|webp|gif|avif)(?:[?\s]|$)/.test(value) || value.startsWith('[sticker')) {
-    return 'images';
-  }
-  if (/\.(mp4|webm|mov)(?:[?\s]|$)/.test(value)) return 'videos';
-  if (value.startsWith('[attachment') || /\.(pdf|docx?|xlsx?|pptx?|txt|zip|rar|7z|apk|exe|msi)(?:[?\s]|$)/.test(value)) {
-    return 'files';
-  }
-  if (/https?:\/\//.test(value)) return 'links';
-  return 'messages';
-}
-
-function matchesSearchCategory(content: string, category: string) {
-  return category === 'messages'
-    ? contentCategory(content) === 'messages'
-    : contentCategory(content) === category;
 }
 
 app.get('/health', async () => {
@@ -493,63 +666,7 @@ app.patch('/admin/users/:id', { preHandler: [requireReady, requireSuperAdmin] },
 app.delete('/admin/users/:id', { preHandler: [requireReady, requireSuperAdmin] }, async (request, reply) => {
   const { id } = request.params as { id: string };
   if (id === request.user!.id) return reply.code(400).send({ error: 'Não pode apagar a própria conta' });
-  const target = await prisma.user.findUnique({ where: { id } });
-  if (!target) return reply.code(404).send({ error: 'Utilizador não encontrado' });
-  const ownedServers = await prisma.server.findMany({
-    where: { ownerId: id },
-    select: { id: true, members: { where: { userId: { not: id } }, take: 1 } },
-  });
-  if (ownedServers.some((server) => server.members.length === 0)) {
-    return reply.code(409).send({
-      error: 'Transfira ou elimine os servidores em que este utilizador é o único membro',
-    });
-  }
-  await prisma.$transaction(async (transaction) => {
-    for (const server of ownedServers) {
-      const successor = server.members[0];
-      if (!successor) continue;
-      await transaction.server.update({
-        where: { id: server.id },
-        data: { ownerId: successor.userId },
-      });
-      await transaction.serverMember.update({
-        where: { userId_serverId: { userId: successor.userId, serverId: server.id } },
-        data: { role: 'OWNER' },
-      });
-    }
-    await transaction.user.update({
-      where: { id },
-      data: {
-        username: `deleted-${id}`,
-        passwordHash: await argon2.hash(randomBytes(32).toString('hex')),
-        avatarStoredName: null,
-        bio: '',
-        customStatus: '',
-        presenceMode: 'INVISIBLE',
-        suspended: true,
-        isSuperAdmin: false,
-        deletedAt: new Date(),
-      },
-    });
-    await transaction.friendship.deleteMany({
-      where: { OR: [{ requesterId: id }, { addresseeId: id }] },
-    });
-    await transaction.userBlock.deleteMany({
-      where: { OR: [{ blockerId: id }, { blockedId: id }] },
-    });
-    await transaction.friendInvite.deleteMany({ where: { ownerId: id } });
-  });
-  if (target.avatarStoredName) {
-    fs.rmSync(path.join(config.UPLOAD_DIR, 'avatars', target.avatarStoredName), { force: true });
-  }
-  io.emit('user:update', {
-    id,
-    username: 'Deleted User',
-    avatarUrl: null,
-    bio: '',
-    customStatus: '',
-    status: 'offline',
-  });
+  if (!(await anonymizeUser(id))) return reply.code(404).send({ error: 'Utilizador não encontrado' });
   return { ok: true };
 });
 
@@ -692,6 +809,23 @@ app.patch('/users/me', { preHandler: requireReady }, async (request, reply) => {
   return { user: publicUser(user) };
 });
 
+app.delete('/users/me', { preHandler: requireReady }, async (request, reply) => {
+  if (request.user!.isSuperAdmin) {
+    return reply.code(403).send({ error: 'A conta principal do site não pode ser apagada' });
+  }
+  const { password } = passwordConfirmationSchema.parse(request.body);
+  if (!(await verifyPassword(request.user!.id, password))) {
+    return reply.code(401).send({ error: 'Palavra-passe incorreta' });
+  }
+  await anonymizeUser(request.user!.id);
+  reply.clearCookie('webcord_session', {
+    path: '/',
+    sameSite: 'lax',
+    secure: request.protocol === 'https',
+  });
+  return { ok: true };
+});
+
 app.put('/users/me/presence', { preHandler: requireReady }, async (request, reply) => {
   const { mode } = request.body as { mode?: string };
   if (!mode || !['ONLINE', 'INVISIBLE'].includes(mode)) {
@@ -744,6 +878,25 @@ app.get('/server-images/:storedName', async (request, reply) => {
     '.avif': 'image/avif',
   };
   reply.header('Content-Type', contentTypes[extension] ?? 'application/octet-stream');
+  reply.header('Cache-Control', 'public, max-age=86400');
+  return reply.send(fs.createReadStream(filePath));
+});
+
+app.get('/direct-group-images/:storedName', async (request, reply) => {
+  const { storedName } = request.params as { storedName: string };
+  if (!/^[a-f0-9-]+\.(jpg|png|webp|gif|avif)$/.test(storedName)) {
+    return reply.code(404).send();
+  }
+  const filePath = path.join(config.UPLOAD_DIR, 'direct-group-images', storedName);
+  if (!fs.existsSync(filePath)) return reply.code(404).send();
+  const contentTypes: Record<string, string> = {
+    '.jpg': 'image/jpeg',
+    '.png': 'image/png',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    '.avif': 'image/avif',
+  };
+  reply.header('Content-Type', contentTypes[path.extname(storedName)] ?? 'application/octet-stream');
   reply.header('Cache-Control', 'public, max-age=86400');
   return reply.send(fs.createReadStream(filePath));
 });
@@ -1175,11 +1328,27 @@ app.delete(
       return reply.code(403).send({ error: 'Apenas o criador pode remover outros membros' });
     }
     if (conversation.ownerId === userId) {
-      return reply.code(400).send({ error: 'O criador não pode sair sem apagar o grupo' });
+      const candidates = conversation.members.filter((member) => member.user.id !== userId);
+      const successor = candidates[Math.floor(Math.random() * candidates.length)];
+      if (!successor) {
+        await prisma.directConversation.delete({ where: { id } });
+        io.to(`dm:${id}`).emit('dm:conversation:deleted', { conversationId: id });
+        return { ok: true };
+      }
+      await prisma.$transaction([
+        prisma.directConversation.update({
+          where: { id },
+          data: { ownerId: successor.user.id },
+        }),
+        prisma.directConversationMember.delete({
+          where: { conversationId_userId: { conversationId: id, userId } },
+        }),
+      ]);
+    } else {
+      await prisma.directConversationMember.delete({
+        where: { conversationId_userId: { conversationId: id, userId } },
+      });
     }
-    await prisma.directConversationMember.delete({
-      where: { conversationId_userId: { conversationId: id, userId } },
-    });
     io.to(`dm:${id}`).emit('dm:member:removed', { conversationId: id, userId });
     return { ok: true };
   },
@@ -1260,6 +1429,75 @@ app.patch(
 );
 
 app.post(
+  '/direct-conversations/:id/image',
+  { preHandler: requireReady },
+  async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const conversation = await getDirectConversation(request.user!.id, id);
+    if (!conversation?.isGroup) {
+      return reply.code(404).send({ error: 'Grupo privado não encontrado' });
+    }
+    const file = await request.file({ limits: { fileSize: 10 * 1024 ** 2 } });
+    if (!file) return reply.code(400).send({ error: 'Escolha uma imagem' });
+    const allowed = new Map([
+      ['image/jpeg', '.jpg'],
+      ['image/png', '.png'],
+      ['image/webp', '.webp'],
+      ['image/gif', '.gif'],
+      ['image/avif', '.avif'],
+    ]);
+    const extension = allowed.get(file.mimetype);
+    if (!extension) {
+      file.file.resume();
+      return reply.code(415).send({ error: 'Use uma imagem JPG, PNG, WebP, GIF ou AVIF' });
+    }
+    const directory = path.join(config.UPLOAD_DIR, 'direct-group-images');
+    fs.mkdirSync(directory, { recursive: true });
+    const storedName = `${randomUUID()}${extension}`;
+    const filePath = path.join(directory, storedName);
+    await pipeline(file.file, fs.createWriteStream(filePath));
+    if (file.file.truncated) {
+      fs.rmSync(filePath, { force: true });
+      return reply.code(413).send({ error: 'A imagem não pode exceder 10 MB' });
+    }
+    await prisma.directConversation.update({
+      where: { id },
+      data: { imageStoredName: storedName },
+    });
+    if (conversation.imageStoredName) {
+      fs.rmSync(path.join(directory, conversation.imageStoredName), { force: true });
+    }
+    const imageUrl = `/direct-group-images/${storedName}`;
+    io.to(`dm:${id}`).emit('dm:conversation:update', { conversationId: id, imageUrl });
+    return { imageUrl };
+  },
+);
+
+app.delete(
+  '/direct-conversations/:id/image',
+  { preHandler: requireReady },
+  async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const conversation = await getDirectConversation(request.user!.id, id);
+    if (!conversation?.isGroup) {
+      return reply.code(404).send({ error: 'Grupo privado não encontrado' });
+    }
+    await prisma.directConversation.update({
+      where: { id },
+      data: { imageStoredName: null },
+    });
+    if (conversation.imageStoredName) {
+      fs.rmSync(
+        path.join(config.UPLOAD_DIR, 'direct-group-images', conversation.imageStoredName),
+        { force: true },
+      );
+    }
+    io.to(`dm:${id}`).emit('dm:conversation:update', { conversationId: id, imageUrl: null });
+    return { imageUrl: null };
+  },
+);
+
+app.post(
   '/direct-conversations/:id/messages',
   { preHandler: requireReady },
   async (request, reply) => {
@@ -1317,6 +1555,36 @@ app.post(
       }
     }
     return reply.code(201).send({ message: responseMessage });
+  },
+);
+
+app.delete(
+  '/direct-conversations/:conversationId/messages/:messageId',
+  { preHandler: requireReady },
+  async (request, reply) => {
+    const { conversationId, messageId } = request.params as {
+      conversationId: string;
+      messageId: string;
+    };
+    if (!(await getDirectConversation(request.user!.id, conversationId))) {
+      return reply.code(403).send({ error: 'Sem acesso a esta conversa' });
+    }
+    const message = await prisma.directMessage.findFirst({
+      where: { id: messageId, conversationId },
+    });
+    if (!message) return reply.code(404).send({ error: 'Mensagem não encontrada' });
+    if (message.authorId !== request.user!.id) {
+      return reply.code(403).send({ error: 'Só pode apagar as suas próprias mensagens' });
+    }
+    await prisma.$transaction([
+      prisma.directMessage.updateMany({
+        where: { replyToId: messageId },
+        data: { replyToId: null },
+      }),
+      prisma.directMessage.delete({ where: { id: messageId } }),
+    ]);
+    io.to(`dm:${conversationId}`).emit('dm:message:deleted', { conversationId, messageId });
+    return { ok: true };
   },
 );
 
@@ -1716,6 +1984,20 @@ app.get('/servers', { preHandler: requireReady }, async (request) => ({
       where: { members: { some: { userId: request.user!.id } } },
       include: {
         channels: { orderBy: { position: 'asc' } },
+        bans: {
+          orderBy: { createdAt: 'desc' },
+          include: {
+            user: {
+              select: {
+                id: true,
+                username: true,
+                createdAt: true,
+                avatarStoredName: true,
+                presenceMode: true,
+              },
+            },
+          },
+        },
         members: {
           include: {
             user: {
@@ -1732,19 +2014,35 @@ app.get('/servers', { preHandler: requireReady }, async (request) => ({
       },
       orderBy: { createdAt: 'asc' },
     })
-  ).map((server) => ({
-    ...server,
-    imageUrl: server.imageStoredName ? `/server-images/${server.imageStoredName}` : server.imageUrl,
-    members: server.members.map((member) => ({
-      ...member,
-      user: publicUser({
-        ...member.user,
-        isSuperAdmin: false,
-        mustChangePassword: false,
-        suspended: false,
-      }),
-    })),
-  })),
+  ).map((server) => {
+    const requesterRole = server.members.find(
+      (member) => member.userId === request.user!.id,
+    )?.role;
+    return {
+      ...server,
+      imageUrl: server.imageStoredName ? `/server-images/${server.imageStoredName}` : server.imageUrl,
+      bans: requesterRole && ['OWNER', 'ADMIN', 'MODERATOR'].includes(requesterRole)
+        ? server.bans.map((ban) => ({
+          ...ban,
+          user: publicUser({
+            ...ban.user,
+            isSuperAdmin: false,
+            mustChangePassword: false,
+            suspended: false,
+          }),
+        }))
+        : [],
+      members: server.members.map((member) => ({
+        ...member,
+        user: publicUser({
+          ...member.user,
+          isSuperAdmin: false,
+          mustChangePassword: false,
+          suspended: false,
+        }),
+      })),
+    };
+  }),
 }));
 
 app.post('/servers', { preHandler: requireReady }, async (request, reply) => {
@@ -1814,6 +2112,15 @@ app.post('/invites/server/:token', { preHandler: requireReady }, async (request,
     include: { server: { select: { id: true, name: true } } },
   });
   if (!invite) return reply.code(404).send({ error: 'Convite de servidor inválido' });
+  const banned = await prisma.serverBan.findUnique({
+    where: {
+      userId_serverId: {
+        userId: request.user!.id,
+        serverId: invite.serverId,
+      },
+    },
+  });
+  if (banned) return reply.code(403).send({ error: 'Está banido deste servidor' });
   await prisma.serverMember.upsert({
     where: {
       userId_serverId: {
@@ -1834,17 +2141,129 @@ app.post('/invites/server/:token', { preHandler: requireReady }, async (request,
 
 app.delete('/servers/:id', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
+  const { password } = passwordConfirmationSchema.parse(request.body);
   const server = await prisma.server.findUnique({ where: { id } });
   if (!server || server.ownerId !== request.user!.id) {
     return reply.code(403).send({ error: 'Apenas o proprietário pode apagar o servidor' });
   }
+  if (!(await verifyPassword(request.user!.id, password))) {
+    return reply.code(401).send({ error: 'Palavra-passe incorreta' });
+  }
   await prisma.server.delete({ where: { id } });
+  if (server.imageStoredName) {
+    fs.rmSync(path.join(config.UPLOAD_DIR, 'server-images', server.imageStoredName), { force: true });
+  }
+  io.emit('server:deleted', { serverId: id });
+  return { ok: true };
+});
+
+app.delete('/servers/:id/members/me', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const member = await isMember(request.user!.id, id);
+  if (!member) return reply.code(404).send({ error: 'Não pertence a este servidor' });
+  if (member.role === 'OWNER') {
+    return reply.code(400).send({ error: 'O criador tem de apagar o servidor em vez de sair' });
+  }
+  await prisma.serverMember.delete({
+    where: { userId_serverId: { userId: request.user!.id, serverId: id } },
+  });
+  io.emit('server:member:update', { serverId: id });
+  return { ok: true };
+});
+
+app.post('/servers/:id/transfer-ownership', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { userId, password } = ownershipTransferSchema.parse(request.body);
+  const server = await prisma.server.findUnique({ where: { id } });
+  if (!server || server.ownerId !== request.user!.id) {
+    return reply.code(403).send({ error: 'Apenas o criador pode transferir a posse' });
+  }
+  if (userId === request.user!.id) {
+    return reply.code(400).send({ error: 'Escolha outro membro' });
+  }
+  if (!(await verifyPassword(request.user!.id, password))) {
+    return reply.code(401).send({ error: 'Palavra-passe incorreta' });
+  }
+  const successor = await isMember(userId, id);
+  if (!successor) return reply.code(404).send({ error: 'Membro não encontrado' });
+  await prisma.$transaction([
+    prisma.server.update({ where: { id }, data: { ownerId: userId } }),
+    prisma.serverMember.update({
+      where: { userId_serverId: { userId, serverId: id } },
+      data: { role: 'OWNER' },
+    }),
+    prisma.serverMember.update({
+      where: { userId_serverId: { userId: request.user!.id, serverId: id } },
+      data: { role: 'ADMIN' },
+    }),
+  ]);
+  io.emit('server:member:update', { serverId: id });
+  return { ok: true };
+});
+
+app.put('/servers/:id/members/:userId/role', { preHandler: requireReady }, async (request, reply) => {
+  const { id, userId } = request.params as { id: string; userId: string };
+  const { role } = serverRoleSchema.parse(request.body);
+  const server = await prisma.server.findUnique({ where: { id } });
+  if (!server || server.ownerId !== request.user!.id) {
+    return reply.code(403).send({ error: 'Apenas o criador pode atribuir cargos' });
+  }
+  if (userId === request.user!.id) {
+    return reply.code(400).send({ error: 'O cargo do criador não pode ser alterado' });
+  }
+  const existingMember = await isMember(userId, id);
+  if (!existingMember || existingMember.role === 'OWNER') {
+    return reply.code(404).send({ error: 'Membro não encontrado' });
+  }
+  const member = await prisma.serverMember.update({
+    where: { userId_serverId: { userId, serverId: id } },
+    data: { role },
+  });
+  io.emit('server:member:update', { serverId: id });
+  return { member };
+});
+
+app.delete('/servers/:id/members/:userId', { preHandler: requireReady }, async (request, reply) => {
+  const { id, userId } = request.params as { id: string; userId: string };
+  const actor = await isMember(request.user!.id, id);
+  const target = await isMember(userId, id);
+  if (!actor || !target || !['OWNER', 'ADMIN', 'MODERATOR'].includes(actor.role)) {
+    return reply.code(403).send({ error: 'Sem permissão para banir membros' });
+  }
+  if (
+    target.role === 'OWNER'
+    || (roleRank[actor.role] ?? -1) <= (roleRank[target.role] ?? -1)
+  ) {
+    return reply.code(403).send({ error: 'Não pode banir um membro com cargo igual ou superior' });
+  }
+  await prisma.$transaction([
+    prisma.serverMember.delete({
+      where: { userId_serverId: { userId, serverId: id } },
+    }),
+    prisma.serverBan.upsert({
+      where: { userId_serverId: { userId, serverId: id } },
+      create: { userId, serverId: id },
+      update: { createdAt: new Date() },
+    }),
+  ]);
+  io.emit('server:member:update', { serverId: id });
+  io.to(`user:${userId}`).emit('server:banned', { serverId: id });
+  return { ok: true };
+});
+
+app.delete('/servers/:id/bans/:userId', { preHandler: requireReady }, async (request, reply) => {
+  const { id, userId } = request.params as { id: string; userId: string };
+  if (!(await canManage(request.user!.id, id))) {
+    return reply.code(403).send({ error: 'Sem permissão para remover bans' });
+  }
+  await prisma.serverBan.deleteMany({ where: { userId, serverId: id } });
+  io.emit('server:member:update', { serverId: id });
   return { ok: true };
 });
 
 app.post('/servers/:id/image', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
-  if (!(await canManage(request.user!.id, id))) {
+  if (!(await canCustomizeServer(request.user!.id, id))) {
     return reply.code(403).send({ error: 'Sem permissão para alterar a imagem do servidor' });
   }
   const file = await request.file({ limits: { fileSize: 10 * 1024 ** 2 } });
@@ -1885,7 +2304,7 @@ app.post('/servers/:id/image', { preHandler: requireReady }, async (request, rep
 
 app.delete('/servers/:id/image', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
-  if (!(await canManage(request.user!.id, id))) {
+  if (!(await canCustomizeServer(request.user!.id, id))) {
     return reply.code(403).send({ error: 'Sem permissão para alterar a imagem do servidor' });
   }
   const previous = await prisma.server.findUnique({ where: { id } });
@@ -1912,6 +2331,20 @@ app.post('/servers/:id/channels', { preHandler: requireReady }, async (request, 
   });
   io.to(`server:${id}`).emit('channel:created', channel);
   return reply.code(201).send({ channel });
+});
+
+app.delete('/channels/:id', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const channel = await prisma.channel.findUnique({ where: { id } });
+  if (!channel || !(await canManage(request.user!.id, channel.serverId))) {
+    return reply.code(403).send({ error: 'Sem permissão para apagar este canal' });
+  }
+  await prisma.channel.delete({ where: { id } });
+  io.to(`server:${channel.serverId}`).emit('channel:deleted', {
+    serverId: channel.serverId,
+    channelId: id,
+  });
+  return { ok: true };
 });
 
 app.get('/channels/:id/messages', { preHandler: requireReady }, async (request, reply) => {
@@ -2044,6 +2477,29 @@ app.post('/channels/:id/messages', { preHandler: requireReady }, async (request,
   };
   io.to(`channel:${id}`).emit('message:new', responseMessage);
   return reply.code(201).send({ message: responseMessage });
+});
+
+app.delete('/channels/:channelId/messages/:messageId', { preHandler: requireReady }, async (request, reply) => {
+  const { channelId, messageId } = request.params as { channelId: string; messageId: string };
+  const message = await prisma.message.findFirst({
+    where: { id: messageId, channelId },
+    include: { channel: true },
+  });
+  if (!message) return reply.code(404).send({ error: 'Mensagem não encontrada' });
+  const member = await isMember(request.user!.id, message.channel.serverId);
+  if (!member) return reply.code(403).send({ error: 'Sem acesso ao canal' });
+  const canDelete = message.authorId === request.user!.id
+    || ['OWNER', 'ADMIN', 'MODERATOR'].includes(member.role);
+  if (!canDelete) return reply.code(403).send({ error: 'Sem permissão para apagar esta mensagem' });
+  await prisma.$transaction([
+    prisma.message.updateMany({
+      where: { replyToId: messageId },
+      data: { replyToId: null },
+    }),
+    prisma.message.delete({ where: { id: messageId } }),
+  ]);
+  io.to(`channel:${channelId}`).emit('message:deleted', { channelId, messageId });
+  return { ok: true };
 });
 
 app.post('/channels/:id/uploads', { preHandler: requireReady }, async (request, reply) => {
@@ -2203,6 +2659,59 @@ io.on('connection', (socket) => {
       socket.join(`dm:${conversationId}`);
     }
   });
+  socket.on('call:join', async (call: { label?: string; kind?: string; targetId?: string }) => {
+    if (!call?.label || !call.targetId || !['server', 'direct'].includes(call.kind || '')) return;
+    const allowed = call.kind === 'server'
+      ? Boolean(await prisma.channel.findFirst({
+        where: {
+          id: call.targetId,
+          type: { not: 'TEXT' },
+          server: { members: { some: { userId: connectedUserId } } },
+        },
+      }))
+      : Boolean(await getDirectConversation(connectedUserId, call.targetId));
+    if (!allowed) return;
+    await leaveTrackedCall(connectedUserId);
+    const activeCall = {
+      label: call.label.slice(0, 100),
+      kind: call.kind as 'server' | 'direct',
+      targetId: call.targetId,
+    };
+    activeCalls.set(connectedUserId, activeCall);
+    if (activeCall.kind === 'direct') {
+      let session = directCallSessions.get(activeCall.targetId);
+      if (!session) {
+        const startedAt = new Date();
+        const message = await prisma.directMessage.create({
+          data: {
+            content: callLogContent(startedAt),
+            authorId: connectedUserId,
+            conversationId: activeCall.targetId,
+          },
+        });
+        await prisma.directConversation.update({
+          where: { id: activeCall.targetId },
+          data: { updatedAt: startedAt },
+        });
+        session = {
+          messageId: message.id,
+          startedAt,
+          initiatorId: connectedUserId,
+          participants: new Set(),
+        };
+        directCallSessions.set(activeCall.targetId, session);
+        const responseMessage = await serializeDirectMessage(message.id);
+        if (responseMessage) {
+          io.to(`dm:${activeCall.targetId}`).emit('dm:message:new', responseMessage);
+        }
+      }
+      session.participants.add(connectedUserId);
+    }
+    io.emit('user:call:update', { userId: connectedUserId, activeCall });
+  });
+  socket.on('call:leave', async () => {
+    await leaveTrackedCall(connectedUserId);
+  });
   socket.on('typing', (channelId: string) => {
     socket.to(`channel:${channelId}`).emit('typing', {
       channelId,
@@ -2213,6 +2722,7 @@ io.on('connection', (socket) => {
     const remaining = Math.max(0, (onlineUsers.get(connectedUserId) ?? 1) - 1);
     if (remaining === 0) {
       onlineUsers.delete(connectedUserId);
+      void leaveTrackedCall(connectedUserId);
       io.emit('presence:update', { userId: connectedUserId, status: 'offline' });
     } else {
       onlineUsers.set(connectedUserId, remaining);

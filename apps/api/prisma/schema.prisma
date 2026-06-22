@@ -42,6 +42,7 @@ model User {
   createdAt           DateTime       @default(now())
   updatedAt           DateTime       @updatedAt
   memberships         ServerMember[]
+  serverBans          ServerBan[]
   ownedServers        Server[]       @relation("ServerOwner")
   serverInvites       ServerInvite[]
   friendInvite        FriendInvite?
@@ -72,6 +73,7 @@ model Server {
   channels    Channel[]
   roles       Role[]
   invites     ServerInvite[]
+  bans        ServerBan[]
   createdAt   DateTime       @default(now())
   updatedAt   DateTime       @updatedAt
 }
@@ -106,6 +108,18 @@ model ServerMember {
   joinedAt  DateTime   @default(now())
 
   @@unique([userId, serverId])
+}
+
+model ServerBan {
+  id        String   @id @default(cuid())
+  userId    String
+  serverId  String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  server    Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, serverId])
+  @@index([serverId, createdAt])
 }
 
 model Channel {
@@ -179,6 +193,7 @@ model DirectConversation {
   userA     User?           @relation("DirectUserA", fields: [userAId], references: [id], onDelete: Cascade)
   userB     User?           @relation("DirectUserB", fields: [userBId], references: [id], onDelete: Cascade)
   name      String?
+  imageStoredName String?
   isGroup   Boolean         @default(false)
   ownerId   String?
   owner     User?           @relation("DirectConversationOwner", fields: [ownerId], references: [id], onDelete: SetNull)
