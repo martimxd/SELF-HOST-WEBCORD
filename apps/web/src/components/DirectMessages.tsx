@@ -5,6 +5,7 @@ import {
   Camera,
   Check,
   DoorOpen,
+  Heart,
   Link2,
   Image,
   MessageCircle,
@@ -98,7 +99,7 @@ export function DirectMessages({
   const [acceptingFriendId, setAcceptingFriendId] = useState('');
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
   const [forwardingMessage, setForwardingMessage] = useState<Message | null>(null);
-  const [mediaPicker, setMediaPicker] = useState<'gifs' | 'stickers' | null>(null);
+  const [mediaPicker, setMediaPicker] = useState<'gifs' | 'stickers' | 'favorites' | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [messageCursor, setMessageCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -456,6 +457,24 @@ export function DirectMessages({
     setReplyingTo(null);
   };
 
+  const favoriteGif = async (gif: {
+    gifId: string;
+    title: string;
+    url: string;
+    previewUrl: string;
+    source: string;
+  }) => {
+    try {
+      await api('/gif-favorites', {
+        method: 'POST',
+        body: JSON.stringify(gif),
+      });
+      setNotice('GIF guardado nos favoritos');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   const loadOlderMessages = async () => {
     if (!selectedId || !messageCursor || loadingOlder) return;
     const container = messagesRef.current;
@@ -762,6 +781,7 @@ export function DirectMessages({
                       onReply={setReplyingTo}
                       onForward={setForwardingMessage}
                       onProfile={(author) => openProfile(author.username)}
+                      onFavoriteGif={favoriteGif}
                       authorDisplayName={
                         !selected.isGroup
                         && selected.nickname
@@ -791,6 +811,7 @@ export function DirectMessages({
                     <label className="attach" title="Enviar anexo"><Plus /><input type="file" onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])} /></label>
                     <input value={text} onChange={(event) => setText(event.target.value)} placeholder={`Mensagem para ${title}`} />
                     <button type="button" onClick={() => setMediaPicker(mediaPicker === 'gifs' ? null : 'gifs')} title="Enviar GIF"><Image size={19} /></button>
+                    <button type="button" onClick={() => setMediaPicker(mediaPicker === 'favorites' ? null : 'favorites')} title="GIFs favoritos"><Heart size={19} /></button>
                     <button type="button" onClick={() => setMediaPicker(mediaPicker === 'stickers' ? null : 'stickers')} title="Enviar figurinha"><Sticker size={19} /></button>
                     <button><Send size={20} /></button>
                   </form>

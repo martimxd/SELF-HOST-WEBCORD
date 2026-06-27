@@ -24,6 +24,35 @@ export type Channel = {
   serverId?: string;
   name: string;
   type: 'TEXT' | 'VOICE' | 'VIDEO';
+  position?: number;
+  category?: string | null;
+  isPrivate?: boolean;
+  isReadOnly?: boolean;
+};
+
+export type ServerPermission =
+  | 'ADMINISTRATOR'
+  | 'MANAGE_SERVER'
+  | 'MANAGE_CHANNELS'
+  | 'MANAGE_ROLES'
+  | 'KICK_MEMBERS'
+  | 'BAN_MEMBERS'
+  | 'MANAGE_MESSAGES'
+  | 'MENTION_EVERYONE'
+  | 'SEND_MESSAGES'
+  | 'READ_MESSAGES'
+  | 'ATTACH_FILES'
+  | 'JOIN_CALL'
+  | 'SPEAK_IN_CALL'
+  | 'MUTE_MEMBERS'
+  | 'DEAFEN_MEMBERS';
+
+export type ServerRole = {
+  id: string;
+  name: string;
+  color: string;
+  position: number;
+  permissions: ServerPermission[];
 };
 
 export type Server = {
@@ -32,9 +61,28 @@ export type Server = {
   name: string;
   description: string;
   imageUrl?: string | null;
+  permissions?: ServerPermission[];
   channels: Channel[];
-  members: Array<{ id: string; role: string; joinedAt: string; user: User }>;
-  bans?: Array<{ id: string; createdAt: string; user: User }>;
+  roles?: ServerRole[];
+  members: Array<{
+    id: string;
+    role: string;
+    nickname?: string | null;
+    timeoutUntil?: string | null;
+    joinedAt: string;
+    permissions?: ServerPermission[];
+    roleAssignments?: Array<{ id: string; role: ServerRole }>;
+    user: User;
+  }>;
+  bans?: Array<{ id: string; createdAt: string; reason?: string | null; user: User; moderator?: User | null }>;
+  moderationLogs?: Array<{
+    id: string;
+    action: string;
+    details: string;
+    targetUserId?: string | null;
+    createdAt: string;
+    actor?: User | null;
+  }>;
 };
 
 export type Message = {
@@ -99,4 +147,14 @@ export type GiphyGif = {
   width: number;
   height: number;
   analyticsOnSend: string;
+};
+
+export type GifFavorite = {
+  id: string;
+  gifId: string;
+  title: string;
+  url: string;
+  previewUrl: string;
+  source: string;
+  createdAt: string;
 };

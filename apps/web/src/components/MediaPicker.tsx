@@ -1,20 +1,23 @@
-import { Image, Search, Sticker as StickerIcon, Trash2, Upload, X } from 'lucide-react';
+import { Heart, Image, Search, Sticker as StickerIcon, Trash2, Upload, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '../api';
-import type { GiphyGif, Sticker } from '../types';
+import type { GifFavorite, GiphyGif, Sticker } from '../types';
+import { useI18n } from '../i18n';
 
 export function MediaPicker({
   initialTab,
   onClose,
   onSend,
 }: {
-  initialTab: 'gifs' | 'stickers';
+  initialTab: 'gifs' | 'stickers' | 'favorites';
   onClose: () => void;
   onSend: (content: string) => Promise<void>;
 }) {
+  const { t } = useI18n();
   const [tab, setTab] = useState(initialTab);
   const [query, setQuery] = useState('');
   const [gifs, setGifs] = useState<GiphyGif[]>([]);
+  const [favorites, setFavorites] = useState<GifFavorite[]>([]);
   const [stickers, setStickers] = useState<Sticker[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -46,10 +49,45 @@ export function MediaPicker({
     }
   };
 
+  const loadFavorites = async () => {
+    setLoading(true);
+    try {
+      const result = await api<{ gifs: GifFavorite[] }>('/gif-favorites');
+      setFavorites(result.gifs);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
     if (tab === 'gifs') loadGifs();
+    else if (tab === 'favorites') loadFavorites();
     else loadStickers();
   }, [tab]);
+
+  const favoriteGif = async (gif: GiphyGif) => {
+    const result = await api<{ favorite: GifFavorite }>('/gif-favorites', {
+      method: 'POST',
+      body: JSON.stringify({
+        gifId: gif.id,
+        title: gif.title || 'GIF',
+        url: gif.url,
+        previewUrl: gif.previewUrl,
+        source: 'giphy',
+      }),
+    });
+    setFavorites((items) => [
+      result.favorite,
+      ...items.filter((item) => item.gifId !== result.favorite.gifId),
+    ]);
+  };
+
+  const removeFavorite = async (gifId: string) => {
+    await api(`/gif-favorites/${encodeURIComponent(gifId)}`, { method: 'DELETE' });
+    setFavorites((items) => items.filter((item) => item.gifId !== gifId));
+  };
 
   const sendGif = async (gif: GiphyGif) => {
     await onSend(`[giphy id="${gif.id}" title="${encodeURIComponent(gif.title)}"]\n${gif.url}`);
@@ -59,6 +97,11 @@ export function MediaPicker({
         body: JSON.stringify({ url: gif.analyticsOnSend }),
       }).catch(() => undefined);
     }
+    onClose();
+  };
+
+  const sendFavorite = async (gif: GifFavorite) => {
+    await onSend(`[giphy id="${gif.gifId}" title="${encodeURIComponent(gif.title)}"]\n${gif.url}`);
     onClose();
   };
 
@@ -88,29 +131,77 @@ export function MediaPicker({
   return (
     <div className="media-picker">
       <header>
-        <button className={tab === 'gifs' ? 'active' : ''} onClick={() => setTab('gifs')}><Image /> GIFs</button>
-        <button className={tab === 'stickers' ? 'active' : ''} onClick={() => setTab('stickers')}><StickerIcon /> Figurinhas</button>
+        <button className={tab === 'gifs' ? 'active' : ''} onClick={() => setTab('gifs')}><Image /> {t('gifs')}</button>
+        <button className={tab === 'favorites' ? 'active' : ''} onClick={() => setTab('favorites')}><Heart /> {t('favoriteGifs')}</button>
+        <button className={tab === 'stickers' ? 'active' : ''} onClick={() => setTab('stickers')}><StickerIcon /> {t('stickers')}</button>
         <button className="picker-close" onClick={onClose}><X /></button>
       </header>
       {tab === 'gifs' ? (
         <>
           <form className="picker-search" onSubmit={(event) => { event.preventDefault(); loadGifs(query); }}>
             <Search />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar no GIPHY" maxLength={50} />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('searchGiphy')} maxLength={50} />
           </form>
           <div className="giphy-grid">
             {gifs.map((gif) => (
               <button key={gif.id} onClick={() => sendGif(gif)} title={gif.title}>
                 <img src={gif.previewUrl} alt={gif.title} loading="lazy" />
+                <span
+                  role="button"
+                  tabIndex={0}
+                  className="gif-favorite-action"
+                  title={t('favoriteGif')}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    favoriteGif(gif).catch((err) => setError(err.message));
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    favoriteGif(gif).catch((err) => setError(err.message));
+                  }}
+                >
+                  <Heart size={14} />
+                </span>
               </button>
             ))}
           </div>
           {!loading && !error && <small className="giphy-attribution">Powered by GIPHY</small>}
         </>
+      ) : tab === 'favorites' ? (
+        <>
+          <div className="giphy-grid favorites-grid">
+            {favorites.map((gif) => (
+              <button key={gif.id} onClick={() => sendFavorite(gif)} title={gif.title}>
+                <img src={gif.previewUrl || gif.url} alt={gif.title} loading="lazy" />
+                <span
+                  role="button"
+                  tabIndex={0}
+                  className="gif-favorite-action remove"
+                  title={t('removeFavoriteGif')}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    removeFavorite(gif.gifId).catch((err) => setError(err.message));
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    removeFavorite(gif.gifId).catch((err) => setError(err.message));
+                  }}
+                >
+                  <Trash2 size={14} />
+                </span>
+              </button>
+            ))}
+          </div>
+          {!favorites.length && !loading && <p className="picker-empty">{t('noFavoriteGifs')}</p>}
+        </>
       ) : (
         <>
           <label className="sticker-upload">
-            <Upload /> Criar figurinha
+            <Upload /> {t('sticker')}
             <input type="file" accept="image/png,image/webp,image/gif" onChange={(event) => event.target.files?.[0] && uploadSticker(event.target.files[0])} />
           </label>
           <div className="sticker-grid">
@@ -120,7 +211,7 @@ export function MediaPicker({
                   <img src={sticker.url} alt={sticker.name} loading="lazy" />
                   <span>{sticker.name}</span>
                 </button>
-                <button className="sticker-delete" onClick={() => deleteSticker(sticker.id)} title="Excluir figurinha"><Trash2 /></button>
+                <button className="sticker-delete" onClick={() => deleteSticker(sticker.id)} title={t('deleteMessage')}><Trash2 /></button>
               </div>
             ))}
           </div>

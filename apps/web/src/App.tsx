@@ -6,6 +6,7 @@ import {
   Crown,
   DoorOpen,
   Hash,
+  Heart,
   Image,
   Link2,
   LogOut,
@@ -25,7 +26,7 @@ import {
   X,
 } from 'lucide-react';
 import { API_URL, api, attachmentMessage, copyText, type UploadedFile } from './api';
-import type { Channel, Message, MessagePage, Server, User } from './types';
+import type { Channel, Message, MessagePage, Server, ServerPermission, ServerRole, User } from './types';
 import { Login } from './components/Login';
 import { InitialChange } from './components/InitialChange';
 import { Admin } from './components/Admin';
@@ -47,7 +48,23 @@ const socket = io(import.meta.env.VITE_SOCKET_URL || window.location.origin, {
   autoConnect: false,
   withCredentials: true,
 });
-const roleRank: Record<string, number> = { MEMBER: 0, MODERATOR: 1, ADMIN: 2, OWNER: 3 };
+const permissionOptions: Array<{ id: ServerPermission; label: string }> = [
+  { id: 'ADMINISTRATOR', label: 'Administrador' },
+  { id: 'MANAGE_SERVER', label: 'Gerir servidor' },
+  { id: 'MANAGE_CHANNELS', label: 'Gerir canais' },
+  { id: 'MANAGE_ROLES', label: 'Gerir cargos' },
+  { id: 'KICK_MEMBERS', label: 'Expulsar membros' },
+  { id: 'BAN_MEMBERS', label: 'Banir membros' },
+  { id: 'MANAGE_MESSAGES', label: 'Gerir mensagens' },
+  { id: 'MENTION_EVERYONE', label: 'Mencionar everyone' },
+  { id: 'SEND_MESSAGES', label: 'Enviar mensagens' },
+  { id: 'READ_MESSAGES', label: 'Ler mensagens' },
+  { id: 'ATTACH_FILES', label: 'Anexar ficheiros' },
+  { id: 'JOIN_CALL', label: 'Entrar em call' },
+  { id: 'SPEAK_IN_CALL', label: 'Falar em call' },
+  { id: 'MUTE_MEMBERS', label: 'Mutar membros' },
+  { id: 'DEAFEN_MEMBERS', label: 'Deafen membros' },
+];
 
 function ServerRail({
   servers,
@@ -107,7 +124,7 @@ export function App() {
   const [notice, setNotice] = useState('');
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
   const [forwardingMessage, setForwardingMessage] = useState<Message | null>(null);
-  const [mediaPicker, setMediaPicker] = useState<'gifs' | 'stickers' | null>(null);
+  const [mediaPicker, setMediaPicker] = useState<'gifs' | 'stickers' | 'favorites' | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [messageCursor, setMessageCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -117,17 +134,29 @@ export function App() {
   const [serverDeletePassword, setServerDeletePassword] = useState('');
   const [ownershipPassword, setOwnershipPassword] = useState('');
   const [ownershipTargetId, setOwnershipTargetId] = useState('');
+  const [serverEditName, setServerEditName] = useState('');
+  const [serverEditDescription, setServerEditDescription] = useState('');
+  const [roleName, setRoleName] = useState('');
+  const [roleColor, setRoleColor] = useState('#8b5cf6');
+  const [rolePermissions, setRolePermissions] = useState<ServerPermission[]>(['READ_MESSAGES', 'SEND_MESSAGES']);
   const messagesRef = useRef<HTMLElement>(null);
   const registrationToken = new URLSearchParams(window.location.search).get('register');
 
   const server = servers.find((item) => item.id === serverId);
   const channel = server?.channels.find((item) => item.id === channelId);
   const membership = server?.members.find((item) => item.user.id === user?.id);
+  const serverPermissionSet = useMemo(() => new Set(server?.permissions ?? []), [server?.permissions]);
+  const hasPermission = (permission: ServerPermission) =>
+    serverPermissionSet.has('ADMINISTRATOR') || serverPermissionSet.has(permission);
   const canCreateChannels = Boolean(
-    membership && ['OWNER', 'ADMIN', 'MODERATOR'].includes(membership.role),
+    membership && (hasPermission('MANAGE_CHANNELS') || ['OWNER', 'ADMIN', 'MODERATOR'].includes(membership.role)),
   );
   const isServerOwner = membership?.role === 'OWNER';
-  const canCustomizeServer = Boolean(membership && ['OWNER', 'ADMIN'].includes(membership.role));
+  const canCustomizeServer = Boolean(membership && (hasPermission('MANAGE_SERVER') || ['OWNER', 'ADMIN'].includes(membership.role)));
+  const canManageRoles = Boolean(membership && (hasPermission('MANAGE_ROLES') || isServerOwner));
+  const canManageMessages = Boolean(membership && (hasPermission('MANAGE_MESSAGES') || ['OWNER', 'ADMIN', 'MODERATOR'].includes(membership.role)));
+  const canKickMembers = Boolean(membership && (hasPermission('KICK_MEMBERS') || ['OWNER', 'ADMIN', 'MODERATOR'].includes(membership.role)));
+  const canBanMembers = Boolean(membership && (hasPermission('BAN_MEMBERS') || ['OWNER', 'ADMIN', 'MODERATOR'].includes(membership.role)));
 
   const loadServers = useCallback(async () => {
     const result = await api<{ servers: Server[] }>('/servers');
@@ -163,6 +192,12 @@ export function App() {
       socket.disconnect();
     };
   }, [user?.id, user?.username, user?.mustChangePassword, loadServers]);
+
+  useEffect(() => {
+    if (!server) return;
+    setServerEditName(server.name);
+    setServerEditDescription(server.description || '');
+  }, [server?.id, server?.name, server?.description]);
 
   useEffect(() => {
     const enable = () => { void enableNotificationSound(); };
@@ -452,6 +487,21 @@ export function App() {
     setChannelId(channel.id);
   };
 
+  const updateServerDetails = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!server) return;
+    try {
+      await api(`/servers/${server.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name: serverEditName, description: serverEditDescription }),
+      });
+      await loadServers();
+      setNotice('Alteração aplicada');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   const uploadServerImage = async (file: File) => {
     if (!server) return;
     const form = new FormData();
@@ -488,6 +538,53 @@ export function App() {
     }
   };
 
+  const updateChannel = async (target: Channel, patch: Partial<Channel>) => {
+    try {
+      await api(`/channels/${target.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+      });
+      await loadServers();
+      setNotice('Canal atualizado');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const editChannel = async (target: Channel) => {
+    const name = prompt('Nome do canal', target.name);
+    if (!name) return;
+    const category = prompt('Categoria do canal', target.category || '');
+    await updateChannel(target, {
+      name,
+      category: category || null,
+      isPrivate: confirm('Canal privado? OK para sim, Cancelar para não.'),
+      isReadOnly: target.type === 'TEXT'
+        ? confirm('Canal só leitura? OK para sim, Cancelar para não.')
+        : false,
+    });
+  };
+
+  const moveChannel = async (target: Channel, direction: -1 | 1) => {
+    if (!server) return;
+    const channels = [...server.channels].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+    const index = channels.findIndex((item) => item.id === target.id);
+    const nextIndex = index + direction;
+    if (index < 0 || nextIndex < 0 || nextIndex >= channels.length) return;
+    const [item] = channels.splice(index, 1);
+    if (!item) return;
+    channels.splice(nextIndex, 0, item);
+    try {
+      await api(`/servers/${server.id}/channels/order`, {
+        method: 'PATCH',
+        body: JSON.stringify({ orderedIds: channels.map((channel) => channel.id) }),
+      });
+      await loadServers();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   const deleteMessage = async (message: Message) => {
     if (!channel || !confirm('Apagar esta mensagem?')) return;
     try {
@@ -512,10 +609,127 @@ export function App() {
     }
   };
 
+  const createRole = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!server) return;
+    try {
+      await api(`/servers/${server.id}/roles`, {
+        method: 'POST',
+        body: JSON.stringify({
+          name: roleName,
+          color: roleColor,
+          permissions: rolePermissions,
+          position: (server.roles?.[0]?.position ?? 100) + 10,
+        }),
+      });
+      setRoleName('');
+      setRolePermissions(['READ_MESSAGES', 'SEND_MESSAGES']);
+      await loadServers();
+      setNotice('Cargo criado');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const editRole = async (role: ServerRole) => {
+    if (!server) return;
+    const name = prompt('Nome do cargo', role.name);
+    if (!name) return;
+    const color = prompt('Cor HEX do cargo', role.color) || role.color;
+    try {
+      await api(`/servers/${server.id}/roles/${role.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name, color }),
+      });
+      await loadServers();
+      setNotice('Cargo atualizado');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const deleteRole = async (role: ServerRole) => {
+    if (!server || !confirm(`Apagar o cargo ${role.name}?`)) return;
+    try {
+      await api(`/servers/${server.id}/roles/${role.id}`, { method: 'DELETE' });
+      await loadServers();
+      setNotice('Cargo apagado');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const updateMemberRoles = async (userId: string, roleIds: string[]) => {
+    if (!server) return;
+    try {
+      await api(`/servers/${server.id}/members/${userId}/roles`, {
+        method: 'PUT',
+        body: JSON.stringify({ roleIds }),
+      });
+      await loadServers();
+      setNotice('Cargos do membro atualizados');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const updateMemberNickname = async (userId: string, currentNickname?: string | null) => {
+    if (!server) return;
+    const nickname = prompt('Nickname neste servidor', currentNickname || '');
+    if (nickname === null) return;
+    try {
+      await api(`/servers/${server.id}/members/${userId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ nickname: nickname || null }),
+      });
+      await loadServers();
+      setNotice('Nickname atualizado');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const timeoutMember = async (userId: string) => {
+    if (!server) return;
+    const minutes = prompt('Timeout em minutos. Deixa vazio para remover timeout.', '10');
+    if (minutes === null) return;
+    const value = Number(minutes);
+    const until = minutes.trim() && Number.isFinite(value)
+      ? new Date(Date.now() + Math.max(1, value) * 60_000).toISOString()
+      : null;
+    try {
+      await api(`/servers/${server.id}/members/${userId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ until, reason: until ? `Timeout ${minutes} minutos` : 'Timeout removido' }),
+      });
+      await loadServers();
+      setNotice(until ? 'Timeout aplicado' : 'Timeout removido');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const kickMember = async (userId: string, username: string) => {
+    if (!server || !confirm(`Expulsar @${username} deste servidor?`)) return;
+    try {
+      await api(`/servers/${server.id}/members/${userId}/kick`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: 'Expulso pelo painel de gestão' }),
+      });
+      await loadServers();
+      setNotice('Membro expulso');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   const banMember = async (userId: string, username: string) => {
     if (!server || !confirm(`Banir @${username} deste servidor?`)) return;
     try {
-      await api(`/servers/${server.id}/members/${userId}`, { method: 'DELETE' });
+      await api(`/servers/${server.id}/members/${userId}/ban`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: 'Banido pelo painel de gestão' }),
+      });
       await loadServers();
       setNotice('Membro banido');
     } catch (err) {
@@ -620,6 +834,24 @@ export function App() {
       body: JSON.stringify({ content, replyToId: replyingTo?.id }),
     });
     setReplyingTo(null);
+  };
+
+  const favoriteGif = async (gif: {
+    gifId: string;
+    title: string;
+    url: string;
+    previewUrl: string;
+    source: string;
+  }) => {
+    try {
+      await api('/gif-favorites', {
+        method: 'POST',
+        body: JSON.stringify(gif),
+      });
+      setNotice(t('favoriteGif'));
+    } catch (err) {
+      setError((err as Error).message);
+    }
   };
 
   const upload = async (file: File) => {
@@ -819,8 +1051,9 @@ export function App() {
                   onReply={setReplyingTo}
                   onForward={setForwardingMessage}
                   onProfile={(author) => showProfile(author.username)}
+                  onFavoriteGif={favoriteGif}
                   onDelete={
-                    message.author.id === user.id || canCreateChannels
+                    message.author.id === user.id || canManageMessages
                       ? deleteMessage
                       : undefined
                   }
@@ -854,8 +1087,9 @@ export function App() {
                   }}
                   placeholder={`${t('messageTo')} #${channel.name}`}
                 />
-                <button type="button" onClick={() => setMediaPicker(mediaPicker === 'gifs' ? null : 'gifs')} title="Enviar GIF"><Image size={19} /></button>
-                <button type="button" onClick={() => setMediaPicker(mediaPicker === 'stickers' ? null : 'stickers')} title="Enviar figurinha"><Sticker size={19} /></button>
+                <button type="button" onClick={() => setMediaPicker(mediaPicker === 'gifs' ? null : 'gifs')} title={t('sendGif')}><Image size={19} /></button>
+                <button type="button" onClick={() => setMediaPicker(mediaPicker === 'favorites' ? null : 'favorites')} title={t('favoriteGifs')}><Heart size={19} /></button>
+                <button type="button" onClick={() => setMediaPicker(mediaPicker === 'stickers' ? null : 'stickers')} title={t('sendSticker')}><Sticker size={19} /></button>
                 <button type="submit"><Send size={20} /></button>
               </form>
             </div>
@@ -919,22 +1153,111 @@ export function App() {
         <div className="modal-backdrop" onClick={() => setServerManagementOpen(false)}>
           <section className="dialog-card server-management-dialog" onClick={(event) => event.stopPropagation()}>
             <button className="modal-close" onClick={() => setServerManagementOpen(false)}><X /></button>
-            <span className="eyebrow">GESTÃO DO SERVIDOR</span>
+            <span className="eyebrow">{t('serverManagement')}</span>
             <h2>{server.name}</h2>
             <p className="muted">O teu cargo: {membership.role.toLowerCase()}</p>
 
+            {canCustomizeServer && (
+              <>
+                <h3>{t('editServer')}</h3>
+                <form className="management-form server-details-form" onSubmit={updateServerDetails}>
+                  <input value={serverEditName} onChange={(event) => setServerEditName(event.target.value)} minLength={2} maxLength={80} />
+                  <input value={serverEditDescription} onChange={(event) => setServerEditDescription(event.target.value)} maxLength={500} placeholder="Descrição" />
+                  <button className="secondary-button">{t('save')}</button>
+                </form>
+                <div className="server-image-actions modal-server-image-actions">
+                  <label title="Alterar imagem do servidor">
+                    <Camera size={15} /> {t('serverImage')}
+                    <input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" onChange={(event) => event.target.files?.[0] && uploadServerImage(event.target.files[0])} />
+                  </label>
+                  {server.imageUrl && <button title="Remover imagem do servidor" onClick={removeServerImage}><Trash2 size={15} /></button>}
+                </div>
+              </>
+            )}
+
             {canCreateChannels && (
               <>
-                <h3>Membros e cargos</h3>
+                <h3>{t('channels')}</h3>
+                <div className="server-member-management channel-management-list">
+                  {server.channels.map((item) => (
+                    <div className="managed-member-row channel-management-row" key={item.id}>
+                      {item.type === 'TEXT' ? <Hash size={18} /> : item.type === 'VIDEO' ? <Video size={18} /> : <Mic size={18} />}
+                      <span>
+                        <strong>#{item.name}</strong>
+                        <small>
+                          {item.type.toLowerCase()}
+                          {item.category ? ` · ${item.category}` : ''}
+                          {item.isPrivate ? ' · privado' : ''}
+                          {item.isReadOnly ? ' · só leitura' : ''}
+                        </small>
+                      </span>
+                      <button className="secondary-button compact-action" onClick={() => moveChannel(item, -1)}>↑</button>
+                      <button className="secondary-button compact-action" onClick={() => moveChannel(item, 1)}>↓</button>
+                      <button className="secondary-button compact-action" onClick={() => editChannel(item)}><Settings size={15} /></button>
+                      <button className="danger-icon-button" onClick={() => deleteChannel(item)} title={t('deleteChannel')}><Trash2 size={16} /></button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {canManageRoles && (
+              <>
+                <h3>Cargos e permissões</h3>
+                <form className="role-create-form" onSubmit={createRole}>
+                  <input value={roleName} onChange={(event) => setRoleName(event.target.value)} placeholder="Nome do cargo" minLength={1} maxLength={80} />
+                  <input type="color" value={roleColor} onChange={(event) => setRoleColor(event.target.value)} />
+                  <div className="permission-grid">
+                    {permissionOptions.map((permission) => (
+                      <label key={permission.id}>
+                        <input
+                          type="checkbox"
+                          checked={rolePermissions.includes(permission.id)}
+                          onChange={(event) => {
+                            setRolePermissions((current) =>
+                              event.target.checked
+                                ? [...current, permission.id]
+                                : current.filter((item) => item !== permission.id),
+                            );
+                          }}
+                        />
+                        <span>{permission.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                  <button className="secondary-button"><Plus size={16} /> Criar cargo</button>
+                </form>
+                <div className="server-member-management role-list">
+                  {server.roles?.map((role) => (
+                    <div className="managed-member-row" key={role.id}>
+                      <span className="role-color-dot" style={{ background: role.color }} />
+                      <span>
+                        <strong>{role.name}</strong>
+                        <small>{role.permissions.length} permissões · posição {role.position}</small>
+                      </span>
+                      <button className="secondary-button compact-action" onClick={() => editRole(role)}><Settings size={15} /></button>
+                      <button className="danger-icon-button" onClick={() => deleteRole(role)}><Trash2 size={16} /></button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {(canCreateChannels || canKickMembers || canBanMembers || canManageRoles) && (
+              <>
+                <h3>{t('membersAndRoles')}</h3>
                 <div className="server-member-management">
                   {server.members.map((member) => (
                     <div className="managed-member-row" key={member.id}>
                       <UserAvatar user={member.user} />
                       <span>
-                        <strong>@{member.user.username}</strong>
-                        <small>{member.role.toLowerCase()}</small>
+                        <strong>{member.nickname || `@${member.user.username}`}</strong>
+                        <small>
+                          @{member.user.username} · {member.role.toLowerCase()} · entrou {new Date(member.joinedAt).toLocaleDateString('pt-PT')}
+                          {member.timeoutUntil ? ` · timeout ${new Date(member.timeoutUntil).toLocaleString('pt-PT')}` : ''}
+                        </small>
                       </span>
-                      {isServerOwner && member.user.id !== user.id ? (
+                      {canManageRoles && member.user.id !== user.id ? (
                         <select
                           value={member.role}
                           onChange={(event) => updateMemberRole(member.user.id, event.target.value)}
@@ -944,34 +1267,89 @@ export function App() {
                           <option value="MEMBER">Membro</option>
                         </select>
                       ) : <em>{member.role === 'OWNER' ? <Crown size={16} /> : member.role}</em>}
+                      {canManageRoles && member.user.id !== user.id && (
+                        <select
+                          multiple
+                          value={member.roleAssignments?.map((assignment) => assignment.role.id) ?? []}
+                          onChange={(event) => updateMemberRoles(
+                            member.user.id,
+                            Array.from(event.currentTarget.selectedOptions).map((option) => option.value),
+                          )}
+                        >
+                          {server.roles?.map((role) => (
+                            <option key={role.id} value={role.id}>{role.name}</option>
+                          ))}
+                        </select>
+                      )}
+                      {(canCustomizeServer || member.user.id === user.id) && (
+                        <button className="secondary-button compact-action" onClick={() => updateMemberNickname(member.user.id, member.nickname)}>
+                          <UserCog size={15} />
+                        </button>
+                      )}
+                      {canManageMessages && member.user.id !== user.id && member.role !== 'OWNER' && (
+                        <button className="secondary-button compact-action" onClick={() => timeoutMember(member.user.id)}>
+                          Timeout
+                        </button>
+                      )}
                       {member.user.id !== user.id
                         && member.role !== 'OWNER'
-                        && (roleRank[membership.role] ?? -1) > (roleRank[member.role] ?? -1) && (
-                        <button
-                          className="danger-icon-button"
-                          onClick={() => banMember(member.user.id, member.user.username)}
-                          title="Banir membro"
-                        >
-                          <Ban size={17} />
-                        </button>
+                        && (canKickMembers || canBanMembers) && (
+                        <>
+                          {canKickMembers && (
+                            <button
+                              className="danger-icon-button"
+                              onClick={() => kickMember(member.user.id, member.user.username)}
+                              title="Expulsar membro"
+                            >
+                              <DoorOpen size={17} />
+                            </button>
+                          )}
+                          {canBanMembers && (
+                            <button
+                              className="danger-icon-button"
+                              onClick={() => banMember(member.user.id, member.user.username)}
+                              title={t('banMember')}
+                            >
+                              <Ban size={17} />
+                            </button>
+                          )}
+                        </>
                       )}
                     </div>
                   ))}
                 </div>
                 {(server.bans?.length ?? 0) > 0 && (
                   <>
-                    <h3>Utilizadores banidos</h3>
+                    <h3>{t('bannedUsers')}</h3>
                     <div className="server-member-management">
                       {server.bans?.map((ban) => (
                         <div className="managed-member-row" key={ban.id}>
                           <UserAvatar user={ban.user} />
-                          <span><strong>@{ban.user.username}</strong><small>Banido</small></span>
-                          <button className="secondary-button" onClick={() => unbanMember(ban.user.id)}>Desbanir</button>
+                          <span>
+                            <strong>@{ban.user.username}</strong>
+                            <small>{ban.reason || 'Banido'} · {new Date(ban.createdAt).toLocaleDateString('pt-PT')}</small>
+                          </span>
+                          <button className="secondary-button" onClick={() => unbanMember(ban.user.id)}>{t('unban')}</button>
                         </div>
                       ))}
                     </div>
                   </>
                 )}
+              </>
+            )}
+
+            {(server.moderationLogs?.length ?? 0) > 0 && (
+              <>
+                <h3>Logs de moderação</h3>
+                <div className="moderation-log-list">
+                  {server.moderationLogs?.map((log) => (
+                    <div key={log.id}>
+                      <strong>{log.action}</strong>
+                      <span>{log.actor ? `@${log.actor.username}` : 'sistema'} · {new Date(log.createdAt).toLocaleString('pt-PT')}</span>
+                      {log.details && <small>{log.details}</small>}
+                    </div>
+                  ))}
+                </div>
               </>
             )}
 

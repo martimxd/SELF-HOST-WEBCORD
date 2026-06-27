@@ -1,7 +1,44 @@
-import { Forward, Phone, Reply, Trash2 } from 'lucide-react';
+import { Forward, Heart, Phone, Reply, Trash2 } from 'lucide-react';
 import type { Message, User } from '../types';
 import { MessageContent } from './MessageContent';
 import { UserAvatar } from './UserAvatar';
+import { useI18n } from '../i18n';
+
+function smallHash(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = Math.imul(31, hash) + value.charCodeAt(index) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+export function extractGifFavorite(content: string) {
+  const rich = content.match(/^\[giphy id="([^"]+)" title="([^"]*)"\]\n(https?:\/\/[^\s]+)$/);
+  if (rich?.[1] && rich[3]) {
+    let title = 'GIF';
+    try {
+      title = rich[2] ? decodeURIComponent(rich[2]) : 'GIF';
+    } catch {
+      title = 'GIF';
+    }
+    return {
+      gifId: rich[1],
+      title,
+      url: rich[3],
+      previewUrl: rich[3],
+      source: 'giphy',
+    };
+  }
+  const url = content.match(/https?:\/\/[^\s]+\.gif(?:\?[^\s]*)?/i)?.[0];
+  if (!url) return null;
+  return {
+    gifId: `url-${smallHash(url)}`,
+    title: 'GIF',
+    url,
+    previewUrl: url,
+    source: 'url',
+  };
+}
 
 export function MessageRow({
   message,
@@ -10,6 +47,7 @@ export function MessageRow({
   onProfile,
   authorDisplayName,
   onDelete,
+  onFavoriteGif,
 }: {
   message: Message;
   onReply: (message: Message) => void;
@@ -17,7 +55,10 @@ export function MessageRow({
   onProfile?: (user: Pick<User, 'id' | 'username' | 'avatarUrl' | 'status'>) => void;
   authorDisplayName?: string;
   onDelete?: (message: Message) => void;
+  onFavoriteGif?: (gif: NonNullable<ReturnType<typeof extractGifFavorite>>) => void;
 }) {
+  const { t } = useI18n();
+  const gifFavorite = extractGifFavorite(message.content);
   const callLog = message.content.match(
     /^\[call-log started="([^"]+)" ended="([^"]*)" duration="(\d+)"\]$/,
   );
@@ -34,10 +75,10 @@ export function MessageRow({
       <article className="message call-log-message">
         <div className="call-log-icon"><Phone size={18} /></div>
         <div>
-          <strong>{endedValue ? 'Chamada terminada' : 'Chamada iniciada'}</strong>
+          <strong>{endedValue ? t('callEnded') : t('callStarted')}</strong>
           <span>
             {startedAt.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' })}
-            {endedValue ? ` · duração ${durationLabel}` : ' · em curso'}
+            {endedValue ? ` · ${durationLabel}` : ` · ${t('callInProgress')}`}
           </span>
         </div>
       </article>
@@ -70,9 +111,12 @@ export function MessageRow({
         <MessageContent content={message.content} />
       </div>
       <div className="message-actions">
-        <button onClick={() => onReply(message)} title="Responder"><Reply size={16} /></button>
-        <button onClick={() => onForward(message)} title="Reencaminhar"><Forward size={16} /></button>
-        {onDelete && <button onClick={() => onDelete(message)} title="Apagar mensagem"><Trash2 size={16} /></button>}
+        <button onClick={() => onReply(message)} title={t('reply')}><Reply size={16} /></button>
+        <button onClick={() => onForward(message)} title={t('forward')}><Forward size={16} /></button>
+        {gifFavorite && onFavoriteGif && (
+          <button onClick={() => onFavoriteGif(gifFavorite)} title={t('favoriteGif')}><Heart size={16} /></button>
+        )}
+        {onDelete && <button onClick={() => onDelete(message)} title={t('deleteMessage')}><Trash2 size={16} /></button>}
       </div>
     </article>
   );

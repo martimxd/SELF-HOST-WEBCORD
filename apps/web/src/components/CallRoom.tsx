@@ -5,15 +5,17 @@ import {
   LiveKitRoom,
   ParticipantTile,
   RoomAudioRenderer,
-  TrackToggle,
   VideoTrack,
+  useLocalParticipant,
+  useRoomContext,
   useTracks,
 } from '@livekit/components-react';
-import { Mic, MicOff, MonitorUp, PhoneOff, Video } from 'lucide-react';
-import { Track } from 'livekit-client';
+import { Mic, MicOff, MonitorUp, PhoneOff, ScreenShare, ScreenShareOff, Video, VideoOff, Volume2, VolumeX } from 'lucide-react';
+import { RoomEvent, Track } from 'livekit-client';
 import type { Socket } from 'socket.io-client';
 import { api } from '../api';
 import { qualityProfiles, type QualityProfile } from '@webcord/shared';
+import { useI18n } from '../i18n';
 
 type CallRoomProps = {
   name: string;
@@ -25,10 +27,67 @@ type CallRoomProps = {
 };
 
 function CallStage() {
+  const { t } = useI18n();
+  const room = useRoomContext();
+  const { localParticipant } = useLocalParticipant();
+  const [micEnabled, setMicEnabled] = useState(true);
+  const [cameraEnabled, setCameraEnabled] = useState(true);
+  const [screenEnabled, setScreenEnabled] = useState(false);
+  const [deafened, setDeafened] = useState(false);
   const tracks = useTracks([
     { source: Track.Source.Camera, withPlaceholder: true },
     { source: Track.Source.ScreenShare, withPlaceholder: false },
   ]);
+
+  const setRemoteAudioEnabled = (enabled: boolean) => {
+    room.remoteParticipants.forEach((participant) => {
+      participant.audioTrackPublications.forEach((publication) => {
+        publication.setEnabled(enabled);
+      });
+    });
+  };
+
+  useEffect(() => {
+    setRemoteAudioEnabled(!deafened);
+    const onTrackSubscribed = () => setRemoteAudioEnabled(!deafened);
+    room.on(RoomEvent.TrackSubscribed, onTrackSubscribed);
+    return () => {
+      room.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
+      setRemoteAudioEnabled(true);
+    };
+  }, [deafened, room]);
+
+  const toggleMic = async () => {
+    if (deafened) {
+      setDeafened(false);
+      setRemoteAudioEnabled(true);
+    }
+    const next = !micEnabled;
+    await localParticipant.setMicrophoneEnabled(next);
+    setMicEnabled(next);
+  };
+
+  const toggleCamera = async () => {
+    const next = !cameraEnabled;
+    await localParticipant.setCameraEnabled(next);
+    setCameraEnabled(next);
+  };
+
+  const toggleScreen = async () => {
+    const next = !screenEnabled;
+    await localParticipant.setScreenShareEnabled(next);
+    setScreenEnabled(next);
+  };
+
+  const toggleDeafen = async () => {
+    const next = !deafened;
+    setDeafened(next);
+    setRemoteAudioEnabled(!next);
+    if (next) {
+      await localParticipant.setMicrophoneEnabled(false);
+      setMicEnabled(false);
+    }
+  };
 
   return (
     <div className="call-experience">
@@ -74,10 +133,35 @@ function CallStage() {
       </div>
       <div className="call-controls">
         <div className="custom-call-controls">
-          <TrackToggle source={Track.Source.Microphone} title="Ligar ou desligar microfone" />
-          <TrackToggle source={Track.Source.Camera} title="Ligar ou desligar câmara" />
-          <TrackToggle source={Track.Source.ScreenShare} title="Partilhar ecrã" />
-          <DisconnectButton className="lk-disconnect-button" title="Sair da chamada">
+          <button
+            className={`lk-button ${micEnabled ? '' : 'danger-active'}`}
+            onClick={toggleMic}
+            title={micEnabled ? t('microphoneOn') : t('microphoneOff')}
+          >
+            {micEnabled ? <Mic size={19} /> : <MicOff size={19} />}
+          </button>
+          <button
+            className={`lk-button ${deafened ? 'danger-active' : ''}`}
+            onClick={toggleDeafen}
+            title={deafened ? t('deafenOff') : t('deafenOn')}
+          >
+            {deafened ? <VolumeX size={19} /> : <Volume2 size={19} />}
+          </button>
+          <button
+            className={`lk-button ${cameraEnabled ? '' : 'danger-active'}`}
+            onClick={toggleCamera}
+            title={cameraEnabled ? t('cameraOn') : t('cameraOff')}
+          >
+            {cameraEnabled ? <Video size={19} /> : <VideoOff size={19} />}
+          </button>
+          <button
+            className={`lk-button ${screenEnabled ? 'active' : ''}`}
+            onClick={toggleScreen}
+            title={t('shareScreen')}
+          >
+            {screenEnabled ? <ScreenShareOff size={19} /> : <ScreenShare size={19} />}
+          </button>
+          <DisconnectButton className="lk-disconnect-button" title={t('leaveCall')}>
             <PhoneOff size={19} />
           </DisconnectButton>
         </div>
@@ -95,6 +179,7 @@ export function CallRoom({
   callKind,
   callTargetId,
 }: CallRoomProps) {
+  const { t } = useI18n();
   const [token, setToken] = useState('');
   const [quality, setQuality] = useState<QualityProfile>('medium');
   const [error, setError] = useState('');
@@ -105,7 +190,7 @@ export function CallRoom({
 
   const join = async () => {
     if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) {
-      setError('Este navegador não suporta chamadas WebRTC.');
+      setError(t('webRtcUnavailable'));
       return;
     }
     setJoining(true);
@@ -128,10 +213,10 @@ export function CallRoom({
     return (
       <div className="call-lobby">
         <div className="call-icon">{videoEnabled ? <Video /> : <Mic />}</div>
-        <span className="eyebrow">SALA DE CHAMADA</span>
+        <span className="eyebrow">{t('callRoomEyebrow')}</span>
         <h1>{name}</h1>
-        <p>Escolhe a qualidade inicial e entra. Dentro da sala podes controlar o microfone, a câmara e a partilha de ecrã.</p>
-        <label>Qualidade
+        <p>{t('callText')}</p>
+        <label>{t('quality')}
           <select value={quality} onChange={(event) => setQuality(event.target.value as QualityProfile)}>
             <option value="low">480p · 25 fps</option>
             <option value="medium">720p · 30 fps</option>
@@ -139,7 +224,7 @@ export function CallRoom({
           </select>
         </label>
         <button className="primary" disabled={joining} onClick={join}>
-          {joining ? 'A entrar…' : 'Entrar na chamada'}
+          {joining ? t('loggingIn') : t('enterCall')}
         </button>
         {error && <div className="form-error">{error}</div>}
       </div>
@@ -161,6 +246,13 @@ export function CallRoom({
           },
         } : false}
         audio
+        options={{
+          adaptiveStream: true,
+          dynacast: true,
+          publishDefaults: {
+            videoEncoding: { maxBitrate: profile.maxBitrate, maxFramerate: profile.frameRate },
+          },
+        }}
         onConnected={() => {
           setConnected(true);
           socket.emit('call:join', {
@@ -175,7 +267,7 @@ export function CallRoom({
           setToken('');
         }}
         onError={(roomError) => {
-          setError(roomError.message || 'Não foi possível ligar à chamada.');
+          setError(roomError.message || t('webRtcUnavailable'));
           setToken('');
         }}
       >

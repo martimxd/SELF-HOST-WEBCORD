@@ -6,6 +6,7 @@ export type UploadedFile = {
   mimeType: string;
   size: number;
   url: string;
+  thumbnailUrl?: string | null;
 };
 
 export function attachmentMessage(upload: UploadedFile) {
