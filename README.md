@@ -21,12 +21,16 @@ Open source project distributed under the MIT license.
 - Image, video, and audio previews.
 - Replies and message forwarding across channels and DMs.
 - GIPHY search with configurable content rating.
+- Per-user GIF favorites that can be saved from messages and reused.
 - Personal PNG, WEBP, and GIF stickers.
 - Categorized search for messages, images, videos, files, and links.
 - Single-use registration links created only by the super-admin, with optional expiration.
 - Cards for documents, files, APKs, and EXEs.
 - LiveKit calls with screen sharing.
+- Call mute, deafen, camera, and screen-share controls.
+- Server settings, ownership transfer, member kick/ban/unban, nicknames, timeouts, roles, permissions, channel privacy/read-only flags, and moderation logs.
 - Account administration and upload limits.
+- Image compression, upload deduplication, and lightweight media thumbnails.
 - Deleted accounts are anonymized as `Deleted User` while preserving conversation history.
 - Interface in Portuguese, English, and French.
 
@@ -132,7 +136,7 @@ username: admin
 password: admin
 ```
 
-The first login forces you to choose a different username and a strong password immediately.
+The login page only shows these credentials while the initial super-admin account still exists and still requires the first password change. After the first login, WebCord forces you to choose a different username and a strong password. After that change, the login page no longer displays the initial credentials.
 
 ## Configuration
 
@@ -149,6 +153,12 @@ Main `.env` variables:
 | `GIPHY_API_KEY` | Optional GIPHY API key used by the GIF picker |
 | `GIPHY_RATING` | Maximum GIPHY content rating, such as `pg-13` |
 | `GIPHY_COUNTRY_CODE` | Two-letter country code sent to GIPHY |
+| `MEDIA_OPTIMIZATION_ENABLED` | Enables image compression and thumbnail generation, default `true` |
+| `MEDIA_IMAGE_MAX_WIDTH` | Largest image dimension kept during optimization, default `1920` |
+| `MEDIA_IMAGE_QUALITY` | Image quality from `50` to `100`, default `82` |
+| `MEDIA_THUMBNAIL_WIDTH` | Thumbnail max width, default `480` |
+| `UPLOAD_CLEANUP_ENABLED` | Enables optional preview-cache cleanup on API start, default `false` |
+| `UPLOAD_RETENTION_DAYS` | Age threshold used by cleanup for orphan previews, default `365` |
 | `VITE_API_URL` | Should normally remain `/api` |
 | `VITE_SOCKET_URL` | Empty uses the same domain as the site |
 | `VITE_LIVEKIT_URL` | Empty uses `ws(s)://domain/livekit` |
@@ -157,7 +167,13 @@ Never publish `.env`.
 
 To enable GIF search, create an API key in the
 [GIPHY Developer Dashboard](https://developers.giphy.com/) and set
-`GIPHY_API_KEY` in `.env`. Personal stickers do not require GIPHY.
+`GIPHY_API_KEY` in `.env`. Personal stickers and saved GIF favorites do not require GIPHY after a GIF URL already exists in a message.
+
+## Media storage
+
+Uploaded files are stored once when an identical file hash already exists. Images are compressed when `MEDIA_OPTIMIZATION_ENABLED=true`; WebCord keeps the original visual format when practical and only replaces the stored file if the optimized result is smaller. GIFs and videos remain streamable, and supported media receives lightweight thumbnails under the uploads volume.
+
+Upload size is controlled in the admin settings by `maxUploadBytes` and defaults to 2 GB. The environment variables above control image quality and thumbnail size. Optional cleanup only removes orphan preview-cache files, not message attachments, so old messages and existing uploads remain compatible.
 
 ## Access methods
 
