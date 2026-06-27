@@ -1,37 +1,52 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import Fastify, { type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import multipart from '@fastify/multipart';
+import type { MultipartFile } from '@fastify/multipart';
 import rateLimit from '@fastify/rate-limit';
 import argon2 from 'argon2';
 import sanitizeHtml from 'sanitize-html';
+import sharp from 'sharp';
 import { Server as SocketServer } from 'socket.io';
 import { AccessToken } from 'livekit-server-sdk';
 import { ZodError } from 'zod';
 import {
+  channelPermissionOverwriteSchema,
+  channelReorderSchema,
   channelSchema,
+  channelUpdateSchema,
   createUserSchema,
+  customRoleSchema,
+  customRoleUpdateSchema,
+  defaultRolePermissions,
   directConversationSchema,
   directGroupMemberSchema,
   directGroupSchema,
   directNicknameSchema,
   forwardMessageSchema,
   friendRequestSchema,
+  gifFavoriteSchema,
   giphySearchSchema,
   initialChangeSchema,
   loginSchema,
+  memberBanSchema,
+  memberNicknameSchema,
+  memberTimeoutSchema,
   messageSchema,
   passwordConfirmationSchema,
   ownershipTransferSchema,
   registrationInviteSchema,
+  roleAssignmentSchema,
   serverRoleSchema,
   serverSchema,
+  serverUpdateSchema,
   updateProfileSchema,
+  type ServerPermission,
 } from '@webcord/shared';
 import { config } from './config.js';
 import { prisma } from './db.js';
@@ -195,17 +210,10 @@ async function leaveTrackedCall(userId: string) {
 async function isMember(userId: string, serverId: string) {
   return prisma.serverMember.findUnique({
     where: { userId_serverId: { userId, serverId } },
+    include: {
+      roleAssignments: { include: { role: true } },
+    },
   });
-}
-
-async function canManage(userId: string, serverId: string) {
-  const member = await isMember(userId, serverId);
-  return member && ['OWNER', 'ADMIN', 'MODERATOR'].includes(member.role);
-}
-
-async function canCustomizeServer(userId: string, serverId: string) {
-  const member = await isMember(userId, serverId);
-  return member && ['OWNER', 'ADMIN'].includes(member.role);
 }
 
 const roleRank: Record<string, number> = {
@@ -215,6 +223,155 @@ const roleRank: Record<string, number> = {
   OWNER: 3,
 };
 
+const allServerPermissions = new Set<ServerPermission>(defaultRolePermissions.OWNER);
+
+function normalizePermissions(values: string[]) {
+  return values.filter((permission): permission is ServerPermission =>
+    allServerPermissions.has(permission as ServerPermission),
+  );
+}
+
+function effectivePermissions(member: Awaited<ReturnType<typeof isMember>>) {
+  const permissions = new Set<ServerPermission>(
+    defaultRolePermissions[member?.role as keyof typeof defaultRolePermissions] ?? [],
+  );
+  for (const assignment of member?.roleAssignments ?? []) {
+    for (const permission of normalizePermissions(assignment.role.permissions)) {
+      permissions.add(permission);
+    }
+  }
+  if (permissions.has('ADMINISTRATOR')) {
+    for (const permission of allServerPermissions) permissions.add(permission);
+  }
+  return permissions;
+}
+
+function isTimedOut(member: Awaited<ReturnType<typeof isMember>>) {
+  return Boolean(member?.timeoutUntil && member.timeoutUntil > new Date());
+}
+
+async function hasServerPermission(userId: string, serverId: string, permission: ServerPermission) {
+  const member = await isMember(userId, serverId);
+  if (!member) return false;
+  const permissions = effectivePermissions(member);
+  return permissions.has('ADMINISTRATOR') || permissions.has(permission);
+}
+
+async function canCustomizeServer(userId: string, serverId: string) {
+  return hasServerPermission(userId, serverId, 'MANAGE_SERVER');
+}
+
+function memberRank(member: Awaited<ReturnType<typeof isMember>>) {
+  if (!member) return -1;
+  const customRank = Math.max(
+    -1,
+    ...member.roleAssignments.map((assignment) => assignment.role.position),
+  );
+  return (roleRank[member.role] ?? 0) * 1000 + customRank;
+}
+
+async function canActOnMember(actorId: string, targetId: string, serverId: string) {
+  const [actor, target] = await Promise.all([
+    isMember(actorId, serverId),
+    isMember(targetId, serverId),
+  ]);
+  return Boolean(actor && target && target.role !== 'OWNER' && memberRank(actor) > memberRank(target));
+}
+
+async function channelPermissionsFor(userId: string, channel: {
+  id: string;
+  serverId: string;
+  isPrivate?: boolean;
+  isReadOnly?: boolean;
+}) {
+  const member = await isMember(userId, channel.serverId);
+  if (!member) return null;
+  const permissions = effectivePermissions(member);
+  if (!permissions.has('ADMINISTRATOR')) {
+    const roleIds = member.roleAssignments.map((assignment) => assignment.roleId);
+    if (roleIds.length > 0) {
+      const overwrites = await prisma.channelPermissionOverwrite.findMany({
+        where: { channelId: channel.id, roleId: { in: roleIds } },
+      });
+      for (const overwrite of overwrites) {
+        for (const permission of normalizePermissions(overwrite.deniedPermissions)) {
+          permissions.delete(permission);
+        }
+        for (const permission of normalizePermissions(overwrite.allowedPermissions)) {
+          permissions.add(permission);
+        }
+      }
+    }
+  }
+  return { member, permissions };
+}
+
+async function canUseChannel(
+  userId: string,
+  channel: { id: string; serverId: string; isPrivate?: boolean; isReadOnly?: boolean },
+  permission: ServerPermission,
+) {
+  const context = await channelPermissionsFor(userId, channel);
+  if (!context) return false;
+  const { permissions } = context;
+  if (permissions.has('ADMINISTRATOR')) return true;
+  if (channel.isReadOnly && permission === 'SEND_MESSAGES' && !permissions.has('MANAGE_MESSAGES')) {
+    return false;
+  }
+  if (channel.isPrivate && permission === 'READ_MESSAGES') {
+    return permissions.has('MANAGE_CHANNELS') || permissions.has('READ_MESSAGES');
+  }
+  return permissions.has(permission);
+}
+
+async function ensureDefaultRoles(serverId: string) {
+  const count = await prisma.role.count({ where: { serverId } });
+  if (count > 0) return;
+  await prisma.role.createMany({
+    data: [
+      {
+        name: 'Admin',
+        color: '#ef4444',
+        position: 300,
+        permissions: defaultRolePermissions.ADMIN,
+        serverId,
+      },
+      {
+        name: 'Moderator',
+        color: '#22d3a7',
+        position: 200,
+        permissions: defaultRolePermissions.MODERATOR,
+        serverId,
+      },
+      {
+        name: 'Member',
+        color: '#8b5cf6',
+        position: 100,
+        permissions: defaultRolePermissions.MEMBER,
+        serverId,
+      },
+    ],
+  });
+}
+
+async function logModeration(
+  serverId: string,
+  actorId: string | null,
+  action: string,
+  details = '',
+  targetUserId?: string,
+) {
+  await prisma.moderationLog.create({
+    data: {
+      serverId,
+      actorId,
+      targetUserId,
+      action,
+      details: sanitizeHtml(details, { allowedTags: [], allowedAttributes: {} }).slice(0, 500),
+    },
+  });
+}
+
 async function verifyPassword(userId: string, password: string) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -222,6 +379,188 @@ async function verifyPassword(userId: string, password: string) {
   });
   return Boolean(user && await argon2.verify(user.passwordHash, password));
 }
+
+const dangerousUploadTypes = new Set(['text/html', 'image/svg+xml', 'application/javascript']);
+const optimizableImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/avif']);
+const previewImageTypes = new Set([...optimizableImageTypes, 'image/gif']);
+
+function extensionForUpload(filename: string, mimeType: string) {
+  const fromName = path.extname(filename).toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12);
+  if (fromName) return fromName;
+  const byMime: Record<string, string> = {
+    'image/jpeg': '.jpg',
+    'image/png': '.png',
+    'image/webp': '.webp',
+    'image/gif': '.gif',
+    'image/avif': '.avif',
+    'video/mp4': '.mp4',
+    'video/webm': '.webm',
+    'audio/mpeg': '.mp3',
+    'audio/ogg': '.ogg',
+    'application/pdf': '.pdf',
+  };
+  return byMime[mimeType] ?? '.bin';
+}
+
+async function hashFile(filePath: string) {
+  const hash = createHash('sha256');
+  for await (const chunk of fs.createReadStream(filePath)) {
+    hash.update(chunk);
+  }
+  return hash.digest('hex');
+}
+
+async function optimizeImageInPlace(filePath: string, mimeType: string) {
+  const originalSize = fs.statSync(filePath).size;
+  if (!config.MEDIA_OPTIMIZATION_ENABLED || !optimizableImageTypes.has(mimeType)) {
+    return { size: originalSize, originalSize, optimized: false };
+  }
+  const temporary = `${filePath}.optimized`;
+  try {
+    let image = sharp(filePath, { failOn: 'none' })
+      .rotate()
+      .resize({
+        width: config.MEDIA_IMAGE_MAX_WIDTH,
+        height: config.MEDIA_IMAGE_MAX_WIDTH,
+        fit: 'inside',
+        withoutEnlargement: true,
+      });
+    if (mimeType === 'image/jpeg') {
+      image = image.jpeg({ quality: config.MEDIA_IMAGE_QUALITY, mozjpeg: true });
+    } else if (mimeType === 'image/png') {
+      image = image.png({ quality: config.MEDIA_IMAGE_QUALITY, compressionLevel: 9, palette: true });
+    } else if (mimeType === 'image/webp') {
+      image = image.webp({ quality: config.MEDIA_IMAGE_QUALITY });
+    } else if (mimeType === 'image/avif') {
+      image = image.avif({ quality: config.MEDIA_IMAGE_QUALITY });
+    }
+    await image.toFile(temporary);
+    const optimizedSize = fs.statSync(temporary).size;
+    if (optimizedSize > 0 && optimizedSize < originalSize) {
+      fs.renameSync(temporary, filePath);
+      return { size: optimizedSize, originalSize, optimized: true };
+    }
+  } catch (error) {
+    app.log.warn({ error }, 'media optimization failed');
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+  return { size: fs.statSync(filePath).size, originalSize, optimized: false };
+}
+
+async function createThumbnail(filePath: string, mimeType: string) {
+  if (!config.MEDIA_OPTIMIZATION_ENABLED || !previewImageTypes.has(mimeType)) return null;
+  const directory = path.join(config.UPLOAD_DIR, 'previews');
+  fs.mkdirSync(directory, { recursive: true });
+  const storedName = `${randomUUID()}.webp`;
+  const target = path.join(directory, storedName);
+  try {
+    await sharp(filePath, { failOn: 'none', pages: 1 })
+      .rotate()
+      .resize({
+        width: config.MEDIA_THUMBNAIL_WIDTH,
+        height: config.MEDIA_THUMBNAIL_WIDTH,
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .webp({ quality: Math.min(config.MEDIA_IMAGE_QUALITY, 78) })
+      .toFile(target);
+    return storedName;
+  } catch (error) {
+    app.log.warn({ error }, 'thumbnail generation failed');
+    fs.rmSync(target, { force: true });
+    return null;
+  }
+}
+
+function uploadResponse(upload: {
+  id: string;
+  originalName: string;
+  mimeType: string;
+  size: bigint | number;
+  publicToken: string | null;
+  thumbnailStoredName?: string | null;
+}) {
+  return {
+    id: upload.id,
+    originalName: upload.originalName,
+    mimeType: upload.mimeType,
+    size: Number(upload.size),
+    url: `/api/cdn/${upload.publicToken}`,
+    thumbnailUrl: upload.thumbnailStoredName && upload.publicToken
+      ? `/api/cdn/${upload.publicToken}/thumbnail`
+      : null,
+  };
+}
+
+async function handleUpload(
+  file: MultipartFile,
+  userId: string,
+  target: { channelId?: string; directConversationId?: string },
+) {
+  const mimeType = dangerousUploadTypes.has(file.mimetype)
+    ? 'application/octet-stream'
+    : file.mimetype || 'application/octet-stream';
+  const storedName = `${randomUUID()}${extensionForUpload(file.filename, mimeType)}`;
+  const filePath = path.join(config.UPLOAD_DIR, storedName);
+  await pipeline(file.file, fs.createWriteStream(filePath));
+  if (file.file.truncated) {
+    fs.rmSync(filePath, { force: true });
+    return null;
+  }
+  const contentHash = await hashFile(filePath);
+  const duplicate = await prisma.upload.findFirst({
+    where: { contentHash, publicToken: { not: null } },
+    orderBy: { createdAt: 'asc' },
+  });
+  if (duplicate && fs.existsSync(path.join(config.UPLOAD_DIR, duplicate.storedName))) {
+    fs.rmSync(filePath, { force: true });
+    return uploadResponse(duplicate);
+  }
+  const optimization = await optimizeImageInPlace(filePath, mimeType);
+  const thumbnailStoredName = await createThumbnail(filePath, mimeType);
+  const upload = await prisma.upload.create({
+    data: {
+      originalName: sanitizeHtml(file.filename, { allowedTags: [], allowedAttributes: {} }).slice(0, 240)
+        || 'upload',
+      storedName,
+      publicToken: createCdnToken(),
+      mimeType,
+      size: optimization.size,
+      originalSize: optimization.originalSize,
+      optimized: optimization.optimized,
+      optimizedAt: optimization.optimized ? new Date() : null,
+      contentHash,
+      thumbnailStoredName,
+      userId,
+      ...target,
+    },
+  });
+  return uploadResponse(upload);
+}
+
+async function cleanupPreviewCache(force = false) {
+  if (!force && !config.UPLOAD_CLEANUP_ENABLED) return;
+  const previewDirectory = path.join(config.UPLOAD_DIR, 'previews');
+  if (!fs.existsSync(previewDirectory)) return;
+  const keep = new Set(
+    (await prisma.upload.findMany({
+      where: { thumbnailStoredName: { not: null } },
+      select: { thumbnailStoredName: true },
+    }))
+      .map((upload) => upload.thumbnailStoredName)
+      .filter(Boolean),
+  );
+  const cutoff = Date.now() - config.UPLOAD_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  for (const entry of fs.readdirSync(previewDirectory)) {
+    if (keep.has(entry)) continue;
+    const target = path.join(previewDirectory, entry);
+    const stat = fs.statSync(target);
+    if (stat.mtimeMs < cutoff) fs.rmSync(target, { force: true });
+  }
+}
+
+void cleanupPreviewCache().catch((error) => app.log.warn({ error }, 'upload cleanup failed'));
 
 async function anonymizeUser(userId: string) {
   const target = await prisma.user.findUnique({ where: { id: userId } });
@@ -495,6 +834,23 @@ app.get('/health', async () => {
   return { status: 'ok' };
 });
 
+app.get('/auth/install-state', async () => {
+  const initialAdmin = await prisma.user.findFirst({
+    where: {
+      username: 'admin',
+      isSuperAdmin: true,
+      mustChangePassword: true,
+    },
+    select: { id: true },
+  });
+  return {
+    showInitialCredentials: Boolean(initialAdmin),
+    initialAccount: initialAdmin
+      ? { username: 'admin', password: 'admin' }
+      : null,
+  };
+});
+
 app.post(
   '/auth/login',
   { config: { rateLimit: { max: 8, timeWindow: '15 minutes' } } },
@@ -518,12 +874,19 @@ app.post(
       });
       return reply.code(401).send({ error: 'Credenciais inválidas' });
     }
-    await prisma.user.update({
+    const data = {
+      failedLoginAttempts: 0,
+      lockedUntil: null,
+      ...(user.isSuperAdmin && user.username === 'admin' && input.password === 'admin'
+        ? { mustChangePassword: true }
+        : {}),
+    };
+    const authenticatedUser = await prisma.user.update({
       where: { id: user.id },
-      data: { failedLoginAttempts: 0, lockedUntil: null },
+      data,
     });
-    reply.setCookie('webcord_session', signSession(publicUser(user)), sessionCookieOptions(request));
-    return { user: publicUser(user) };
+    reply.setCookie('webcord_session', signSession(publicUser(authenticatedUser)), sessionCookieOptions(request));
+    return { user: publicUser(authenticatedUser) };
   },
 );
 
@@ -701,6 +1064,11 @@ app.put('/admin/settings', { preHandler: [requireReady, requireSuperAdmin] }, as
       update: { value: String(body.maxUploadBytes) },
     });
   }
+  return { ok: true };
+});
+
+app.post('/admin/storage/cleanup', { preHandler: [requireReady, requireSuperAdmin] }, async () => {
+  await cleanupPreviewCache(true);
   return { ok: true };
 });
 
@@ -1221,7 +1589,7 @@ app.post('/direct-conversations', { preHandler: requireReady }, async (request, 
 
 app.post('/direct-groups', { preHandler: requireReady }, async (request, reply) => {
   const input = directGroupSchema.parse(request.body);
-  const usernames = [...new Set(input.usernames)];
+  const usernames = [...new Set(input.usernames)] as string[];
   const users = await prisma.user.findMany({
     where: { username: { in: usernames }, suspended: false },
   });
@@ -1685,37 +2053,11 @@ app.post(
     const maxBytes = Number(maxSetting?.value ?? 2 * 1024 ** 3);
     const file = await request.file({ limits: { fileSize: maxBytes } });
     if (!file) return reply.code(400).send({ error: 'Ficheiro em falta' });
-    const blocked = ['text/html', 'image/svg+xml', 'application/javascript'];
-    const storedName = `${randomUUID()}${path.extname(file.filename).slice(0, 12)}`;
-    await pipeline(file.file, fs.createWriteStream(path.join(config.UPLOAD_DIR, storedName)));
-    if (file.file.truncated) {
-      fs.rmSync(path.join(config.UPLOAD_DIR, storedName), { force: true });
+    const upload = await handleUpload(file, request.user!.id, { directConversationId: id });
+    if (!upload) {
       return reply.code(413).send({ error: `O ficheiro excede o limite de ${maxBytes} bytes` });
     }
-    const stat = fs.statSync(path.join(config.UPLOAD_DIR, storedName));
-    const publicToken = createCdnToken();
-    const upload = await prisma.upload.create({
-      data: {
-        originalName: file.filename,
-        storedName,
-        publicToken,
-        mimeType: blocked.includes(file.mimetype)
-          ? 'application/octet-stream'
-          : file.mimetype || 'application/octet-stream',
-        size: stat.size,
-        userId: request.user!.id,
-        directConversationId: id,
-      },
-    });
-    return reply.code(201).send({
-      upload: {
-        id: upload.id,
-        originalName: upload.originalName,
-        mimeType: upload.mimeType,
-        size: Number(upload.size),
-        url: `/api/cdn/${publicToken}`,
-      },
-    });
+    return reply.code(201).send({ upload });
   },
 );
 
@@ -1820,6 +2162,52 @@ app.get('/giphy/search', { preHandler: requireReady }, async (request, reply) =>
     gifs: (payload.data ?? []).map(normalizeGiphyItem).filter(Boolean),
     attribution: 'GIPHY',
   };
+});
+
+app.get('/gif-favorites', { preHandler: requireReady }, async (request) => {
+  const gifs = await prisma.gifFavorite.findMany({
+    where: { userId: request.user!.id },
+    orderBy: { createdAt: 'desc' },
+  });
+  return { gifs };
+});
+
+app.post('/gif-favorites', { preHandler: requireReady }, async (request, reply) => {
+  const input = gifFavoriteSchema.parse(request.body);
+  const favorite = await prisma.gifFavorite.upsert({
+    where: {
+      userId_gifId: {
+        userId: request.user!.id,
+        gifId: input.gifId,
+      },
+    },
+    create: {
+      userId: request.user!.id,
+      gifId: input.gifId,
+      title: sanitizeHtml(input.title || 'GIF', { allowedTags: [], allowedAttributes: {} }).slice(0, 140) || 'GIF',
+      url: input.url,
+      previewUrl: input.previewUrl,
+      source: input.source,
+    },
+    update: {
+      title: sanitizeHtml(input.title || 'GIF', { allowedTags: [], allowedAttributes: {} }).slice(0, 140) || 'GIF',
+      url: input.url,
+      previewUrl: input.previewUrl,
+      source: input.source,
+    },
+  });
+  return reply.code(201).send({ favorite });
+});
+
+app.delete('/gif-favorites/:gifId', { preHandler: requireReady }, async (request) => {
+  const { gifId } = request.params as { gifId: string };
+  await prisma.gifFavorite.deleteMany({
+    where: {
+      userId: request.user!.id,
+      gifId: decodeURIComponent(gifId),
+    },
+  });
+  return { ok: true };
 });
 
 app.post('/giphy/analytics', { preHandler: requireReady }, async (request, reply) => {
@@ -1978,72 +2366,123 @@ app.post('/messages/forward', { preHandler: requireReady }, async (request, repl
   return reply.code(201).send({ ok: true });
 });
 
-app.get('/servers', { preHandler: requireReady }, async (request) => ({
-  servers: (
-    await prisma.server.findMany({
-      where: { members: { some: { userId: request.user!.id } } },
-      include: {
-        channels: { orderBy: { position: 'asc' } },
-        bans: {
-          orderBy: { createdAt: 'desc' },
-          include: {
-            user: {
-              select: {
-                id: true,
-                username: true,
-                createdAt: true,
-                avatarStoredName: true,
-                presenceMode: true,
-              },
-            },
+app.get('/servers', { preHandler: requireReady }, async (request) => {
+  const load = () => prisma.server.findMany({
+    where: { members: { some: { userId: request.user!.id } } },
+    include: {
+      channels: {
+        orderBy: { position: 'asc' },
+        include: { permissionOverwrites: true },
+      },
+      roles: { orderBy: { position: 'desc' } },
+      moderationLogs: {
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+        include: {
+          actor: {
+            select: { id: true, username: true, avatarStoredName: true, presenceMode: true },
           },
         },
-        members: {
-          include: {
-            user: {
-              select: {
-                id: true,
-                username: true,
-                createdAt: true,
-                avatarStoredName: true,
-                presenceMode: true,
-              },
+      },
+      bans: {
+        orderBy: { createdAt: 'desc' },
+        include: {
+          user: {
+            select: {
+              id: true,
+              username: true,
+              createdAt: true,
+              avatarStoredName: true,
+              presenceMode: true,
+            },
+          },
+          moderator: {
+            select: { id: true, username: true, avatarStoredName: true, presenceMode: true },
+          },
+        },
+      },
+      members: {
+        include: {
+          roleAssignments: { include: { role: true } },
+          user: {
+            select: {
+              id: true,
+              username: true,
+              createdAt: true,
+              avatarStoredName: true,
+              presenceMode: true,
             },
           },
         },
       },
-      orderBy: { createdAt: 'asc' },
-    })
-  ).map((server) => {
-    const requesterRole = server.members.find(
-      (member) => member.userId === request.user!.id,
-    )?.role;
-    return {
-      ...server,
-      imageUrl: server.imageStoredName ? `/server-images/${server.imageStoredName}` : server.imageUrl,
-      bans: requesterRole && ['OWNER', 'ADMIN', 'MODERATOR'].includes(requesterRole)
-        ? server.bans.map((ban) => ({
-          ...ban,
+    },
+    orderBy: { createdAt: 'asc' },
+  });
+  let servers = await load();
+  const missingDefaultRoles = servers.filter((server) => server.roles.length === 0);
+  if (missingDefaultRoles.length > 0) {
+    await Promise.all(missingDefaultRoles.map((server) => ensureDefaultRoles(server.id)));
+    servers = await load();
+  }
+  return {
+    servers: servers.map((server) => {
+      const requester = server.members.find((member) => member.userId === request.user!.id);
+      const requesterPermissions = effectivePermissions(requester ?? null);
+      const canViewModeration = requesterPermissions.has('ADMINISTRATOR')
+        || requesterPermissions.has('MANAGE_SERVER')
+        || requesterPermissions.has('KICK_MEMBERS')
+        || requesterPermissions.has('BAN_MEMBERS')
+        || requesterPermissions.has('MANAGE_MESSAGES');
+      return {
+        ...server,
+        imageUrl: server.imageStoredName ? `/server-images/${server.imageStoredName}` : server.imageUrl,
+        permissions: [...requesterPermissions],
+        bans: canViewModeration
+          ? server.bans.map((ban) => ({
+            ...ban,
+            user: publicUser({
+              ...ban.user,
+              isSuperAdmin: false,
+              mustChangePassword: false,
+              suspended: false,
+            }),
+            moderator: ban.moderator
+              ? publicUser({
+                ...ban.moderator,
+                isSuperAdmin: false,
+                mustChangePassword: false,
+                suspended: false,
+              })
+              : null,
+          }))
+          : [],
+        moderationLogs: canViewModeration
+          ? server.moderationLogs.map((log) => ({
+            ...log,
+            actor: log.actor
+              ? publicUser({
+                ...log.actor,
+                isSuperAdmin: false,
+                mustChangePassword: false,
+                suspended: false,
+              })
+              : null,
+          }))
+          : [],
+        members: server.members.map((member) => ({
+          ...member,
+          permissions: [...effectivePermissions(member)],
           user: publicUser({
-            ...ban.user,
+            ...member.user,
             isSuperAdmin: false,
             mustChangePassword: false,
             suspended: false,
           }),
-        }))
-        : [],
-      members: server.members.map((member) => ({
-        ...member,
-        user: publicUser({
-          ...member.user,
-          isSuperAdmin: false,
-          mustChangePassword: false,
-          suspended: false,
-        }),
-      })),
-    };
-  }),
-}));
+        })),
+      };
+    }),
+  };
+});
 
 app.post('/servers', { preHandler: requireReady }, async (request, reply) => {
   const input = serverSchema.parse(request.body);
@@ -2053,11 +2492,35 @@ app.post('/servers', { preHandler: requireReady }, async (request, reply) => {
       ownerId: request.user!.id,
       members: { create: { userId: request.user!.id, role: 'OWNER' } },
       channels: { create: { name: 'geral', type: 'TEXT' } },
+      roles: {
+        create: [
+          {
+            name: 'Admin',
+            color: '#ef4444',
+            position: 300,
+            permissions: defaultRolePermissions.ADMIN,
+          },
+          {
+            name: 'Moderator',
+            color: '#22d3a7',
+            position: 200,
+            permissions: defaultRolePermissions.MODERATOR,
+          },
+          {
+            name: 'Member',
+            color: '#8b5cf6',
+            position: 100,
+            permissions: defaultRolePermissions.MEMBER,
+          },
+        ],
+      },
     },
     include: {
       channels: true,
+      roles: { orderBy: { position: 'desc' } },
       members: {
         include: {
+          roleAssignments: { include: { role: true } },
           user: {
             select: {
               id: true,
@@ -2076,6 +2539,7 @@ app.post('/servers', { preHandler: requireReady }, async (request, reply) => {
       ...server,
       members: server.members.map((member) => ({
         ...member,
+        permissions: [...effectivePermissions(member)],
         user: publicUser({
           ...member.user,
           isSuperAdmin: false,
@@ -2100,6 +2564,178 @@ app.post('/servers/:id/invites', { preHandler: requireReady }, async (request, r
     },
   });
   return reply.code(201).send({ token: invite.token });
+});
+
+app.patch('/servers/:id', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await hasServerPermission(request.user!.id, id, 'MANAGE_SERVER'))) {
+    return reply.code(403).send({ error: 'Sem permissão para gerir este servidor' });
+  }
+  const input = serverUpdateSchema.parse(request.body);
+  const server = await prisma.server.update({
+    where: { id },
+    data: input,
+  });
+  await logModeration(id, request.user!.id, 'SERVER_UPDATED', JSON.stringify(input));
+  io.to(`server:${id}`).emit('server:member:update', { serverId: id });
+  return { server };
+});
+
+app.post('/servers/:id/roles', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await hasServerPermission(request.user!.id, id, 'MANAGE_ROLES'))) {
+    return reply.code(403).send({ error: 'Sem permissão para criar cargos' });
+  }
+  const input = customRoleSchema.parse(request.body);
+  const role = await prisma.role.create({
+    data: { ...input, serverId: id },
+  });
+  await logModeration(id, request.user!.id, 'ROLE_CREATED', role.name);
+  io.to(`server:${id}`).emit('server:member:update', { serverId: id });
+  return reply.code(201).send({ role });
+});
+
+app.patch('/servers/:id/roles/:roleId', { preHandler: requireReady }, async (request, reply) => {
+  const { id, roleId } = request.params as { id: string; roleId: string };
+  const actor = await isMember(request.user!.id, id);
+  if (!actor || !effectivePermissions(actor).has('MANAGE_ROLES')) {
+    return reply.code(403).send({ error: 'Sem permissão para editar cargos' });
+  }
+  const role = await prisma.role.findFirst({ where: { id: roleId, serverId: id } });
+  if (!role) return reply.code(404).send({ error: 'Cargo não encontrado' });
+  if (actor.role !== 'OWNER' && role.position >= memberRank(actor)) {
+    return reply.code(403).send({ error: 'Não pode editar um cargo igual ou acima do seu' });
+  }
+  const input = customRoleUpdateSchema.parse(request.body);
+  if (actor.role !== 'OWNER' && typeof input.position === 'number' && input.position >= memberRank(actor)) {
+    return reply.code(403).send({ error: 'Não pode mover um cargo acima do seu' });
+  }
+  const updated = await prisma.role.update({
+    where: { id: roleId },
+    data: input,
+  });
+  await logModeration(id, request.user!.id, 'ROLE_UPDATED', updated.name);
+  io.to(`server:${id}`).emit('server:member:update', { serverId: id });
+  return { role: updated };
+});
+
+app.delete('/servers/:id/roles/:roleId', { preHandler: requireReady }, async (request, reply) => {
+  const { id, roleId } = request.params as { id: string; roleId: string };
+  const actor = await isMember(request.user!.id, id);
+  if (!actor || !effectivePermissions(actor).has('MANAGE_ROLES')) {
+    return reply.code(403).send({ error: 'Sem permissão para apagar cargos' });
+  }
+  const role = await prisma.role.findFirst({ where: { id: roleId, serverId: id } });
+  if (!role) return reply.code(404).send({ error: 'Cargo não encontrado' });
+  if (actor.role !== 'OWNER' && role.position >= memberRank(actor)) {
+    return reply.code(403).send({ error: 'Não pode apagar um cargo igual ou acima do seu' });
+  }
+  await prisma.role.delete({ where: { id: roleId } });
+  await logModeration(id, request.user!.id, 'ROLE_DELETED', role.name);
+  io.to(`server:${id}`).emit('server:member:update', { serverId: id });
+  return { ok: true };
+});
+
+app.put('/servers/:id/members/:userId/roles', { preHandler: requireReady }, async (request, reply) => {
+  const { id, userId } = request.params as { id: string; userId: string };
+  const actor = await isMember(request.user!.id, id);
+  const target = await isMember(userId, id);
+  if (!actor || !target || !effectivePermissions(actor).has('MANAGE_ROLES')) {
+    return reply.code(403).send({ error: 'Sem permissão para atribuir cargos' });
+  }
+  if (userId !== request.user!.id && !(await canActOnMember(request.user!.id, userId, id))) {
+    return reply.code(403).send({ error: 'Não pode alterar cargos de um membro igual ou acima do seu' });
+  }
+  const { roleIds } = roleAssignmentSchema.parse(request.body);
+  const roles = await prisma.role.findMany({ where: { id: { in: roleIds }, serverId: id } });
+  if (roles.length !== new Set(roleIds).size) return reply.code(400).send({ error: 'Cargo inválido' });
+  if (actor.role !== 'OWNER' && roles.some((role) => role.position >= memberRank(actor))) {
+    return reply.code(403).send({ error: 'Não pode atribuir um cargo igual ou acima do seu' });
+  }
+  await prisma.$transaction([
+    prisma.roleAssignment.deleteMany({ where: { memberId: target.id } }),
+    ...roles.map((role) =>
+      prisma.roleAssignment.create({ data: { memberId: target.id, roleId: role.id } }),
+    ),
+  ]);
+  await logModeration(id, request.user!.id, 'MEMBER_ROLES_UPDATED', roleIds.join(','), userId);
+  io.emit('server:member:update', { serverId: id });
+  return { ok: true };
+});
+
+app.patch('/servers/:id/members/:userId', { preHandler: requireReady }, async (request, reply) => {
+  const { id, userId } = request.params as { id: string; userId: string };
+  const body = request.body as { nickname?: string | null; until?: string | null; reason?: string };
+  const data: { nickname?: string | null; timeoutUntil?: Date | null } = {};
+  if ('nickname' in body) {
+    if (userId !== request.user!.id && !(await hasServerPermission(request.user!.id, id, 'MANAGE_SERVER'))) {
+      return reply.code(403).send({ error: 'Sem permissão para alterar nicknames' });
+    }
+    const { nickname } = memberNicknameSchema.parse({ nickname: body.nickname });
+    data.nickname = nickname ? sanitizeHtml(nickname, { allowedTags: [], allowedAttributes: {} }) : null;
+  }
+  if ('until' in body) {
+    if (!(await hasServerPermission(request.user!.id, id, 'MANAGE_MESSAGES'))) {
+      return reply.code(403).send({ error: 'Sem permissão para aplicar timeout' });
+    }
+    if (!(await canActOnMember(request.user!.id, userId, id))) {
+      return reply.code(403).send({ error: 'Não pode aplicar timeout a este membro' });
+    }
+    const { until, reason } = memberTimeoutSchema.parse(body);
+    data.timeoutUntil = until ? new Date(until) : null;
+    await logModeration(id, request.user!.id, until ? 'MEMBER_TIMED_OUT' : 'MEMBER_TIMEOUT_REMOVED', reason, userId);
+  }
+  if (Object.keys(data).length === 0) return reply.code(400).send({ error: 'Indique pelo menos uma alteração' });
+  const member = await prisma.serverMember.update({
+    where: { userId_serverId: { userId, serverId: id } },
+    data,
+  });
+  if ('nickname' in data) await logModeration(id, request.user!.id, 'MEMBER_NICKNAME_UPDATED', data.nickname ?? '', userId);
+  io.emit('server:member:update', { serverId: id });
+  return { member };
+});
+
+app.post('/servers/:id/members/:userId/kick', { preHandler: requireReady }, async (request, reply) => {
+  const { id, userId } = request.params as { id: string; userId: string };
+  if (!(await hasServerPermission(request.user!.id, id, 'KICK_MEMBERS'))) {
+    return reply.code(403).send({ error: 'Sem permissão para expulsar membros' });
+  }
+  if (!(await canActOnMember(request.user!.id, userId, id))) {
+    return reply.code(403).send({ error: 'Não pode expulsar um membro com cargo igual ou superior' });
+  }
+  const { reason } = memberBanSchema.parse(request.body ?? {});
+  await prisma.serverMember.delete({
+    where: { userId_serverId: { userId, serverId: id } },
+  });
+  await logModeration(id, request.user!.id, 'MEMBER_KICKED', reason, userId);
+  io.emit('server:member:update', { serverId: id });
+  io.to(`user:${userId}`).emit('server:deleted', { serverId: id });
+  return { ok: true };
+});
+
+app.post('/servers/:id/members/:userId/ban', { preHandler: requireReady }, async (request, reply) => {
+  const { id, userId } = request.params as { id: string; userId: string };
+  if (!(await hasServerPermission(request.user!.id, id, 'BAN_MEMBERS'))) {
+    return reply.code(403).send({ error: 'Sem permissão para banir membros' });
+  }
+  if (!(await canActOnMember(request.user!.id, userId, id))) {
+    return reply.code(403).send({ error: 'Não pode banir um membro com cargo igual ou superior' });
+  }
+  const { reason } = memberBanSchema.parse(request.body ?? {});
+  await prisma.$transaction([
+    prisma.serverMember.delete({
+      where: { userId_serverId: { userId, serverId: id } },
+    }),
+    prisma.serverBan.upsert({
+      where: { userId_serverId: { userId, serverId: id } },
+      create: { userId, serverId: id, moderatorId: request.user!.id, reason },
+      update: { createdAt: new Date(), moderatorId: request.user!.id, reason },
+    }),
+  ]);
+  await logModeration(id, request.user!.id, 'MEMBER_BANNED', reason, userId);
+  io.emit('server:member:update', { serverId: id });
+  io.to(`user:${userId}`).emit('server:banned', { serverId: id });
+  return { ok: true };
 });
 
 app.post('/invites/server/:token', { preHandler: requireReady }, async (request, reply) => {
@@ -2197,6 +2833,7 @@ app.post('/servers/:id/transfer-ownership', { preHandler: requireReady }, async 
       data: { role: 'ADMIN' },
     }),
   ]);
+  await logModeration(id, request.user!.id, 'SERVER_OWNERSHIP_TRANSFERRED', '', userId);
   io.emit('server:member:update', { serverId: id });
   return { ok: true };
 });
@@ -2204,9 +2841,8 @@ app.post('/servers/:id/transfer-ownership', { preHandler: requireReady }, async 
 app.put('/servers/:id/members/:userId/role', { preHandler: requireReady }, async (request, reply) => {
   const { id, userId } = request.params as { id: string; userId: string };
   const { role } = serverRoleSchema.parse(request.body);
-  const server = await prisma.server.findUnique({ where: { id } });
-  if (!server || server.ownerId !== request.user!.id) {
-    return reply.code(403).send({ error: 'Apenas o criador pode atribuir cargos' });
+  if (!(await hasServerPermission(request.user!.id, id, 'MANAGE_ROLES'))) {
+    return reply.code(403).send({ error: 'Sem permissão para atribuir cargos' });
   }
   if (userId === request.user!.id) {
     return reply.code(400).send({ error: 'O cargo do criador não pode ser alterado' });
@@ -2215,37 +2851,38 @@ app.put('/servers/:id/members/:userId/role', { preHandler: requireReady }, async
   if (!existingMember || existingMember.role === 'OWNER') {
     return reply.code(404).send({ error: 'Membro não encontrado' });
   }
+  if (!(await canActOnMember(request.user!.id, userId, id))) {
+    return reply.code(403).send({ error: 'Não pode alterar um membro igual ou acima do seu' });
+  }
   const member = await prisma.serverMember.update({
     where: { userId_serverId: { userId, serverId: id } },
     data: { role },
   });
+  await logModeration(id, request.user!.id, 'MEMBER_BASE_ROLE_UPDATED', role, userId);
   io.emit('server:member:update', { serverId: id });
   return { member };
 });
 
 app.delete('/servers/:id/members/:userId', { preHandler: requireReady }, async (request, reply) => {
   const { id, userId } = request.params as { id: string; userId: string };
-  const actor = await isMember(request.user!.id, id);
-  const target = await isMember(userId, id);
-  if (!actor || !target || !['OWNER', 'ADMIN', 'MODERATOR'].includes(actor.role)) {
+  if (!(await hasServerPermission(request.user!.id, id, 'BAN_MEMBERS'))) {
     return reply.code(403).send({ error: 'Sem permissão para banir membros' });
   }
-  if (
-    target.role === 'OWNER'
-    || (roleRank[actor.role] ?? -1) <= (roleRank[target.role] ?? -1)
-  ) {
+  if (!(await canActOnMember(request.user!.id, userId, id))) {
     return reply.code(403).send({ error: 'Não pode banir um membro com cargo igual ou superior' });
   }
+  const { reason } = memberBanSchema.parse(request.body ?? {});
   await prisma.$transaction([
     prisma.serverMember.delete({
       where: { userId_serverId: { userId, serverId: id } },
     }),
     prisma.serverBan.upsert({
       where: { userId_serverId: { userId, serverId: id } },
-      create: { userId, serverId: id },
-      update: { createdAt: new Date() },
+      create: { userId, serverId: id, moderatorId: request.user!.id, reason },
+      update: { createdAt: new Date(), moderatorId: request.user!.id, reason },
     }),
   ]);
+  await logModeration(id, request.user!.id, 'MEMBER_BANNED', reason, userId);
   io.emit('server:member:update', { serverId: id });
   io.to(`user:${userId}`).emit('server:banned', { serverId: id });
   return { ok: true };
@@ -2253,10 +2890,11 @@ app.delete('/servers/:id/members/:userId', { preHandler: requireReady }, async (
 
 app.delete('/servers/:id/bans/:userId', { preHandler: requireReady }, async (request, reply) => {
   const { id, userId } = request.params as { id: string; userId: string };
-  if (!(await canManage(request.user!.id, id))) {
+  if (!(await hasServerPermission(request.user!.id, id, 'BAN_MEMBERS'))) {
     return reply.code(403).send({ error: 'Sem permissão para remover bans' });
   }
   await prisma.serverBan.deleteMany({ where: { userId, serverId: id } });
+  await logModeration(id, request.user!.id, 'MEMBER_UNBANNED', '', userId);
   io.emit('server:member:update', { serverId: id });
   return { ok: true };
 });
@@ -2298,6 +2936,7 @@ app.post('/servers/:id/image', { preHandler: requireReady }, async (request, rep
     fs.rmSync(path.join(directory, previous.imageStoredName), { force: true });
   }
   const imageUrl = `/server-images/${storedName}`;
+  await logModeration(id, request.user!.id, 'SERVER_IMAGE_UPDATED');
   io.to(`server:${id}`).emit('server:update', { serverId: id, imageUrl });
   return { imageUrl };
 });
@@ -2315,13 +2954,14 @@ app.delete('/servers/:id/image', { preHandler: requireReady }, async (request, r
   if (previous?.imageStoredName) {
     fs.rmSync(path.join(config.UPLOAD_DIR, 'server-images', previous.imageStoredName), { force: true });
   }
+  await logModeration(id, request.user!.id, 'SERVER_IMAGE_REMOVED');
   io.to(`server:${id}`).emit('server:update', { serverId: id, imageUrl: null });
   return { imageUrl: null };
 });
 
 app.post('/servers/:id/channels', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
-  if (!(await canManage(request.user!.id, id))) {
+  if (!(await hasServerPermission(request.user!.id, id, 'MANAGE_CHANNELS'))) {
     return reply.code(403).send({ error: 'Sem permissão' });
   }
   const input = channelSchema.parse(request.body);
@@ -2329,17 +2969,75 @@ app.post('/servers/:id/channels', { preHandler: requireReady }, async (request, 
   const channel = await prisma.channel.create({
     data: { ...input, serverId: id, position: count },
   });
+  await logModeration(id, request.user!.id, 'CHANNEL_CREATED', channel.name);
   io.to(`server:${id}`).emit('channel:created', channel);
   return reply.code(201).send({ channel });
+});
+
+app.patch('/channels/:id', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const channel = await prisma.channel.findUnique({ where: { id } });
+  if (!channel || !(await hasServerPermission(request.user!.id, channel.serverId, 'MANAGE_CHANNELS'))) {
+    return reply.code(403).send({ error: 'Sem permissão para editar este canal' });
+  }
+  const input = channelUpdateSchema.parse(request.body);
+  const updated = await prisma.channel.update({
+    where: { id },
+    data: {
+      ...input,
+      category: input.category === undefined ? undefined : input.category || null,
+    },
+  });
+  await logModeration(channel.serverId, request.user!.id, 'CHANNEL_UPDATED', updated.name);
+  io.to(`server:${channel.serverId}`).emit('channel:created', updated);
+  return { channel: updated };
+});
+
+app.patch('/servers/:id/channels/order', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await hasServerPermission(request.user!.id, id, 'MANAGE_CHANNELS'))) {
+    return reply.code(403).send({ error: 'Sem permissão para ordenar canais' });
+  }
+  const { orderedIds } = channelReorderSchema.parse(request.body) as { orderedIds: string[] };
+  const channels = await prisma.channel.findMany({ where: { id: { in: orderedIds }, serverId: id } });
+  if (channels.length !== new Set(orderedIds).size) return reply.code(400).send({ error: 'Lista de canais inválida' });
+  await prisma.$transaction(
+    orderedIds.map((channelId, position) =>
+      prisma.channel.update({ where: { id: channelId }, data: { position } }),
+    ),
+  );
+  await logModeration(id, request.user!.id, 'CHANNELS_REORDERED', orderedIds.join(','));
+  io.to(`server:${id}`).emit('channel:created', { serverId: id });
+  return { ok: true };
+});
+
+app.put('/channels/:id/permissions/:roleId', { preHandler: requireReady }, async (request, reply) => {
+  const { id, roleId } = request.params as { id: string; roleId: string };
+  const channel = await prisma.channel.findUnique({ where: { id } });
+  if (!channel || !(await hasServerPermission(request.user!.id, channel.serverId, 'MANAGE_CHANNELS'))) {
+    return reply.code(403).send({ error: 'Sem permissão para alterar permissões do canal' });
+  }
+  const role = await prisma.role.findFirst({ where: { id: roleId, serverId: channel.serverId } });
+  if (!role) return reply.code(404).send({ error: 'Cargo não encontrado' });
+  const input = channelPermissionOverwriteSchema.parse(request.body);
+  const overwrite = await prisma.channelPermissionOverwrite.upsert({
+    where: { channelId_roleId: { channelId: id, roleId } },
+    create: { channelId: id, roleId, ...input },
+    update: input,
+  });
+  await logModeration(channel.serverId, request.user!.id, 'CHANNEL_PERMISSIONS_UPDATED', `${channel.name}:${role.name}`);
+  io.to(`server:${channel.serverId}`).emit('channel:created', channel);
+  return { overwrite };
 });
 
 app.delete('/channels/:id', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
   const channel = await prisma.channel.findUnique({ where: { id } });
-  if (!channel || !(await canManage(request.user!.id, channel.serverId))) {
+  if (!channel || !(await hasServerPermission(request.user!.id, channel.serverId, 'MANAGE_CHANNELS'))) {
     return reply.code(403).send({ error: 'Sem permissão para apagar este canal' });
   }
   await prisma.channel.delete({ where: { id } });
+  await logModeration(channel.serverId, request.user!.id, 'CHANNEL_DELETED', channel.name);
   io.to(`server:${channel.serverId}`).emit('channel:deleted', {
     serverId: channel.serverId,
     channelId: id,
@@ -2351,7 +3049,7 @@ app.get('/channels/:id/messages', { preHandler: requireReady }, async (request, 
   const { id } = request.params as { id: string };
   const { cursor } = request.query as { cursor?: string };
   const channel = await prisma.channel.findUnique({ where: { id } });
-  if (!channel || !(await isMember(request.user!.id, channel.serverId))) {
+  if (!channel || !(await canUseChannel(request.user!.id, channel, 'READ_MESSAGES'))) {
     return reply.code(403).send({ error: 'Sem acesso ao canal' });
   }
   const messages = await prisma.message.findMany({
@@ -2396,7 +3094,7 @@ app.get('/channels/:id/search', { preHandler: requireReady }, async (request, re
     category?: string;
   };
   const channel = await prisma.channel.findUnique({ where: { id } });
-  if (!channel || !(await isMember(request.user!.id, channel.serverId))) {
+  if (!channel || !(await canUseChannel(request.user!.id, channel, 'READ_MESSAGES'))) {
     return reply.code(403).send({ error: 'Sem acesso ao canal' });
   }
   if (!['messages', 'images', 'videos', 'files', 'links'].includes(category)) {
@@ -2441,8 +3139,12 @@ app.get('/channels/:id/search', { preHandler: requireReady }, async (request, re
 app.post('/channels/:id/messages', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
   const channel = await prisma.channel.findUnique({ where: { id } });
-  if (!channel || channel.type !== 'TEXT' || !(await isMember(request.user!.id, channel.serverId))) {
+  if (!channel || channel.type !== 'TEXT' || !(await canUseChannel(request.user!.id, channel, 'SEND_MESSAGES'))) {
     return reply.code(403).send({ error: 'Sem acesso ao canal' });
+  }
+  const channelContext = await channelPermissionsFor(request.user!.id, channel);
+  if (isTimedOut(channelContext?.member ?? null)) {
+    return reply.code(403).send({ error: 'Está em timeout neste servidor' });
   }
   const input = messageSchema.parse(request.body);
   const content = sanitizeHtml(input.content, { allowedTags: [], allowedAttributes: {} });
@@ -2489,7 +3191,7 @@ app.delete('/channels/:channelId/messages/:messageId', { preHandler: requireRead
   const member = await isMember(request.user!.id, message.channel.serverId);
   if (!member) return reply.code(403).send({ error: 'Sem acesso ao canal' });
   const canDelete = message.authorId === request.user!.id
-    || ['OWNER', 'ADMIN', 'MODERATOR'].includes(member.role);
+    || effectivePermissions(member).has('MANAGE_MESSAGES');
   if (!canDelete) return reply.code(403).send({ error: 'Sem permissão para apagar esta mensagem' });
   await prisma.$transaction([
     prisma.message.updateMany({
@@ -2498,6 +3200,9 @@ app.delete('/channels/:channelId/messages/:messageId', { preHandler: requireRead
     }),
     prisma.message.delete({ where: { id: messageId } }),
   ]);
+  if (message.authorId !== request.user!.id) {
+    await logModeration(message.channel.serverId, request.user!.id, 'MESSAGE_DELETED', message.content.slice(0, 200), message.authorId);
+  }
   io.to(`channel:${channelId}`).emit('message:deleted', { channelId, messageId });
   return { ok: true };
 });
@@ -2505,41 +3210,22 @@ app.delete('/channels/:channelId/messages/:messageId', { preHandler: requireRead
 app.post('/channels/:id/uploads', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
   const channel = await prisma.channel.findUnique({ where: { id } });
-  if (!channel || !(await isMember(request.user!.id, channel.serverId))) {
+  if (!channel || !(await canUseChannel(request.user!.id, channel, 'ATTACH_FILES'))) {
     return reply.code(403).send({ error: 'Sem acesso ao canal' });
+  }
+  const channelContext = await channelPermissionsFor(request.user!.id, channel);
+  if (isTimedOut(channelContext?.member ?? null)) {
+    return reply.code(403).send({ error: 'Está em timeout neste servidor' });
   }
   const maxSetting = await prisma.setting.findUnique({ where: { key: 'maxUploadBytes' } });
   const maxBytes = Number(maxSetting?.value ?? 2 * 1024 ** 3);
   const file = await request.file({ limits: { fileSize: maxBytes } });
   if (!file) return reply.code(400).send({ error: 'Ficheiro em falta' });
-  const blocked = ['text/html', 'image/svg+xml', 'application/javascript'];
-  const storedName = `${randomUUID()}${path.extname(file.filename).slice(0, 12)}`;
-  await pipeline(file.file, fs.createWriteStream(path.join(config.UPLOAD_DIR, storedName)));
-  if (file.file.truncated) {
-    fs.rmSync(path.join(config.UPLOAD_DIR, storedName), { force: true });
+  const upload = await handleUpload(file, request.user!.id, { channelId: id });
+  if (!upload) {
     return reply.code(413).send({ error: `O ficheiro excede o limite de ${maxBytes} bytes` });
   }
-  const stat = fs.statSync(path.join(config.UPLOAD_DIR, storedName));
-  const upload = await prisma.upload.create({
-    data: {
-      originalName: file.filename,
-      storedName,
-      publicToken: createCdnToken(),
-      mimeType: blocked.includes(file.mimetype) ? 'application/octet-stream' : file.mimetype,
-      size: stat.size,
-      userId: request.user!.id,
-      channelId: id,
-    },
-  });
-  return reply.code(201).send({
-    upload: {
-      id: upload.id,
-      originalName: upload.originalName,
-      mimeType: upload.mimeType,
-      size: Number(upload.size),
-      url: `/api/cdn/${upload.publicToken}`,
-    },
-  });
+  return reply.code(201).send({ upload });
 });
 
 app.get('/cdn/:token', async (request, reply) => {
@@ -2582,6 +3268,23 @@ app.get('/cdn/:token', async (request, reply) => {
   return reply.send(fs.createReadStream(filePath));
 });
 
+app.get('/cdn/:token/thumbnail', async (request, reply) => {
+  const { token } = request.params as { token: string };
+  if (!/^(?:[A-Za-z0-9_-]{64}|[a-f0-9]{144}[a-z0-9.]{0,12})$/.test(token)) {
+    return reply.code(404).send();
+  }
+  const upload = await prisma.upload.findUnique({ where: { publicToken: token } });
+  if (!upload?.thumbnailStoredName) return reply.code(404).send();
+  const filePath = path.join(config.UPLOAD_DIR, 'previews', upload.thumbnailStoredName);
+  if (!fs.existsSync(filePath)) return reply.code(404).send();
+  const stat = fs.statSync(filePath);
+  reply.header('Content-Type', 'image/webp');
+  reply.header('Content-Length', stat.size.toString());
+  reply.header('Cache-Control', 'public, max-age=31536000, immutable');
+  reply.header('X-Content-Type-Options', 'nosniff');
+  return reply.send(fs.createReadStream(filePath));
+});
+
 app.get('/uploads/:id', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
   const upload = await prisma.upload.findUnique({
@@ -2603,7 +3306,7 @@ app.get('/uploads/:id', { preHandler: requireReady }, async (request, reply) => 
 app.post('/channels/:id/call-token', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
   const channel = await prisma.channel.findUnique({ where: { id } });
-  if (!channel || channel.type === 'TEXT' || !(await isMember(request.user!.id, channel.serverId))) {
+  if (!channel || channel.type === 'TEXT' || !(await canUseChannel(request.user!.id, channel, 'JOIN_CALL'))) {
     return reply.code(403).send({ error: 'Sem permissão para entrar na chamada' });
   }
   const caller = await prisma.user.findUnique({

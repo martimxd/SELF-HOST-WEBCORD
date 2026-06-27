@@ -43,6 +43,8 @@ model User {
   updatedAt           DateTime       @updatedAt
   memberships         ServerMember[]
   serverBans          ServerBan[]
+  serverBansIssued    ServerBan[]    @relation("ServerBanModerator")
+  moderationLogs      ModerationLog[] @relation("ModerationLogActor")
   ownedServers        Server[]       @relation("ServerOwner")
   serverInvites       ServerInvite[]
   friendInvite        FriendInvite?
@@ -58,6 +60,7 @@ model User {
   blocksCreated         UserBlock[]  @relation("Blocker")
   blocksReceived        UserBlock[]  @relation("BlockedUser")
   stickers              Sticker[]
+  gifFavorites          GifFavorite[]
   registrationInvites   RegistrationInvite[] @relation("RegistrationInviteCreator")
 }
 
@@ -74,6 +77,7 @@ model Server {
   roles       Role[]
   invites     ServerInvite[]
   bans        ServerBan[]
+  moderationLogs ModerationLog[]
   createdAt   DateTime       @default(now())
   updatedAt   DateTime       @updatedAt
 }
@@ -103,19 +107,26 @@ model ServerMember {
   userId    String
   serverId  String
   role      MemberRole @default(MEMBER)
+  nickname  String?
+  timeoutUntil DateTime?
   user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
   server    Server     @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  roleAssignments RoleAssignment[]
   joinedAt  DateTime   @default(now())
 
   @@unique([userId, serverId])
+  @@index([serverId, role])
 }
 
 model ServerBan {
   id        String   @id @default(cuid())
   userId    String
   serverId  String
+  moderatorId String?
+  reason    String?
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   server    Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  moderator User?    @relation("ServerBanModerator", fields: [moderatorId], references: [id], onDelete: SetNull)
   createdAt DateTime @default(now())
 
   @@unique([userId, serverId])
@@ -127,12 +138,18 @@ model Channel {
   name      String
   type      ChannelType @default(TEXT)
   position  Int         @default(0)
+  category  String?
   isPrivate Boolean     @default(false)
+  isReadOnly Boolean    @default(false)
   serverId  String
   server    Server      @relation(fields: [serverId], references: [id], onDelete: Cascade)
   messages  Message[]
   uploads   Upload[]
+  permissionOverwrites ChannelPermissionOverwrite[]
   createdAt DateTime    @default(now())
+
+  @@index([serverId, position])
+  @@index([serverId, category])
 }
 
 model Message {
@@ -161,6 +178,52 @@ model Role {
   permissions String[]
   serverId    String
   server      Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  assignments RoleAssignment[]
+  channelPermissionOverwrites ChannelPermissionOverwrite[]
+
+  @@index([serverId, position])
+}
+
+model RoleAssignment {
+  id        String       @id @default(cuid())
+  memberId  String
+  roleId    String
+  member    ServerMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  role      Role         @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  createdAt DateTime     @default(now())
+
+  @@unique([memberId, roleId])
+  @@index([roleId])
+}
+
+model ChannelPermissionOverwrite {
+  id                 String   @id @default(cuid())
+  channelId          String
+  roleId             String
+  allowedPermissions String[]
+  deniedPermissions  String[]
+  channel            Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  role               Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([channelId, roleId])
+  @@index([roleId])
+}
+
+model ModerationLog {
+  id          String   @id @default(cuid())
+  serverId    String
+  actorId     String?
+  targetUserId String?
+  action      String
+  details     String   @default("")
+  server      Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  actor       User?    @relation("ModerationLogActor", fields: [actorId], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  @@index([serverId, createdAt])
+  @@index([targetUserId])
 }
 
 model Upload {
@@ -169,6 +232,11 @@ model Upload {
   storedName   String   @unique
   mimeType     String
   size         BigInt
+  originalSize BigInt?
+  optimized    Boolean  @default(false)
+  optimizedAt  DateTime?
+  contentHash  String?
+  thumbnailStoredName String?
   userId       String
   channelId    String?
   directConversationId String?
@@ -179,6 +247,9 @@ model Upload {
   directConversation DirectConversation? @relation(fields: [directConversationId], references: [id], onDelete: Cascade)
   message      Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
   createdAt    DateTime @default(now())
+
+  @@index([contentHash])
+  @@index([createdAt])
 }
 
 model Setting {
@@ -263,6 +334,21 @@ model Sticker {
   createdAt   DateTime @default(now())
 
   @@index([ownerId, createdAt])
+}
+
+model GifFavorite {
+  id         String   @id @default(cuid())
+  userId     String
+  gifId      String
+  title      String
+  url        String
+  previewUrl String
+  source     String   @default("giphy")
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, gifId])
+  @@index([userId, createdAt])
 }
 
 model RegistrationInvite {

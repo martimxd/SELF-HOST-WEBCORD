@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
+  customRoleSchema,
   directGroupSchema,
   directNicknameSchema,
   forwardMessageSchema,
+  gifFavoriteSchema,
   giphySearchSchema,
   initialChangeSchema,
   passwordSchema,
   qualityProfiles,
   registrationInviteSchema,
+  serverPermissions,
   updateProfileSchema,
   updateUsernameSchema,
 } from '@webcord/shared';
@@ -105,6 +108,33 @@ describe('security contracts', () => {
     expect(giphySearchSchema.safeParse({ q: 'x'.repeat(51), offset: 500 }).success).toBe(false);
     expect(registrationInviteSchema.safeParse({ expiresIn: '7d' }).success).toBe(true);
     expect(registrationInviteSchema.safeParse({ expiresIn: '30d' }).success).toBe(false);
+  });
+
+  it('validates GIF favorites and custom role permissions', () => {
+    expect(gifFavoriteSchema.safeParse({
+      gifId: 'abc123',
+      title: 'Reaction',
+      url: 'https://media.example.test/reaction.gif',
+      previewUrl: 'https://media.example.test/reaction-small.gif',
+      source: 'giphy',
+    }).success).toBe(true);
+    expect(gifFavoriteSchema.safeParse({
+      gifId: '',
+      title: 'Bad',
+      url: 'javascript:alert(1)',
+      previewUrl: 'https://example.test/a.gif',
+    }).success).toBe(false);
+    expect(customRoleSchema.safeParse({
+      name: 'Helper',
+      color: '#22d3a7',
+      permissions: ['READ_MESSAGES', 'SEND_MESSAGES'],
+    }).success).toBe(true);
+    expect(customRoleSchema.safeParse({
+      name: 'Broken',
+      color: 'green',
+      permissions: ['ROOT'],
+    }).success).toBe(false);
+    expect(serverPermissions).toContain('DEAFEN_MEMBERS');
   });
 
   it('blocks user administration for non-super-admin accounts', async () => {

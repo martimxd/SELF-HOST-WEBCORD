@@ -26,6 +26,16 @@ async function main() {
     update: {},
     create: { key: 'maxUploadBytes', value: String(2 * 1024 ** 3) },
   });
+  await prisma.setting.upsert({
+    where: { key: 'mediaOptimizationEnabled' },
+    update: {},
+    create: { key: 'mediaOptimizationEnabled', value: 'true' },
+  });
+  await prisma.setting.upsert({
+    where: { key: 'mediaImageQuality' },
+    update: {},
+    create: { key: 'mediaImageQuality', value: '82' },
+  });
 }
 
 main().finally(() => prisma.$disconnect());
