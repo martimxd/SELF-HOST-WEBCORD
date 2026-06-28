@@ -13,7 +13,7 @@ import argon2 from 'argon2';
 import sanitizeHtml from 'sanitize-html';
 import sharp from 'sharp';
 import { Server as SocketServer } from 'socket.io';
-import { AccessToken } from 'livekit-server-sdk';
+import { AccessToken, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
 import { ZodError } from 'zod';
 import {
   channelPermissionOverwriteSchema,
@@ -73,6 +73,12 @@ await app.register(multipart, {
 });
 
 fs.mkdirSync(config.UPLOAD_DIR, { recursive: true });
+fs.mkdirSync(path.join(config.UPLOAD_DIR, 'branding'), { recursive: true });
+const livekitRooms = new RoomServiceClient(
+  config.LIVEKIT_URL,
+  config.LIVEKIT_API_KEY,
+  config.LIVEKIT_API_SECRET,
+);
 const onlineUsers = new Map<string, number>();
 const activeCalls = new Map<string, { label: string; kind: 'server' | 'direct'; targetId: string }>();
 const directCallSessions = new Map<string, {
@@ -173,12 +179,14 @@ async function serializeDirectMessage(messageId: string) {
           },
         },
       },
+      reactions: { select: { emoji: true, userId: true } },
     },
   });
   if (!message) return null;
   return {
     ...message,
     replyTo: serializeReply(message.replyTo),
+    reactions: reactionPayload(message.reactions),
     author: publicUser({
       ...message.author,
       isSuperAdmin: false,
@@ -695,6 +703,54 @@ function createInviteToken() {
   return randomBytes(32).toString('base64url');
 }
 
+const imageContentTypes: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.avif': 'image/avif',
+  '.ico': 'image/x-icon',
+};
+
+const brandingKinds = {
+  'site-icon': { settingKey: 'siteIconStoredName', directory: 'branding' },
+  favicon: { settingKey: 'faviconStoredName', directory: 'branding' },
+  'login-background': { settingKey: 'loginBackgroundStoredName', directory: 'branding' },
+} as const;
+
+function normalizeLanguageSetting(value?: string | null) {
+  return value === 'pt' || value === 'fr' || value === 'en' ? value : 'en';
+}
+
+function publicAssetUrl(storedName?: string | null) {
+  return storedName ? `/branding/${storedName}` : null;
+}
+
+async function siteConfig() {
+  const settings = Object.fromEntries(
+    (await prisma.setting.findMany()).map((item) => [item.key, item.value]),
+  );
+  return {
+    defaultLanguage: normalizeLanguageSetting(settings.defaultLanguage),
+    siteIconUrl: publicAssetUrl(settings.siteIconStoredName),
+    faviconUrl: publicAssetUrl(settings.faviconStoredName),
+    loginBackgroundUrl: publicAssetUrl(settings.loginBackgroundStoredName),
+  };
+}
+
+function callRoomName(kind: 'server' | 'direct', targetId: string) {
+  return kind === 'server' ? `channel-${targetId}` : `dm-${targetId}`;
+}
+
+async function muteParticipantMicrophone(room: string, identity: string) {
+  const participants = await livekitRooms.listParticipants(room).catch(() => []);
+  const participant = participants.find((item) => item.identity === identity);
+  const microphone = participant?.tracks.find((track) => track.source === TrackSource.MICROPHONE);
+  if (!microphone?.sid) return false;
+  await livekitRooms.mutePublishedTrack(room, identity, microphone.sid, true);
+  return true;
+}
+
 function serializeDirectConversation(
   conversation: {
     id: string;
@@ -806,6 +862,27 @@ function serializeReply(reply: {
   };
 }
 
+const allowedReactionEmojis = new Set(['🙂', '👍', '❤️', '😂', '😮', '😢', '🔥', '🎉']);
+
+function reactionPayload(reactions: Array<{ emoji: string; userId: string }>) {
+  const grouped = new Map<string, { emoji: string; count: number; userIds: string[] }>();
+  for (const reaction of reactions) {
+    const current = grouped.get(reaction.emoji) ?? { emoji: reaction.emoji, count: 0, userIds: [] };
+    current.count += 1;
+    current.userIds.push(reaction.userId);
+    grouped.set(reaction.emoji, current);
+  }
+  return [...grouped.values()];
+}
+
+function parseReactionBody(body: unknown) {
+  const emoji = typeof body === 'object' && body && 'emoji' in body
+    ? String((body as { emoji?: unknown }).emoji)
+    : '';
+  if (!allowedReactionEmojis.has(emoji)) return null;
+  return emoji;
+}
+
 type GiphyItem = {
   id?: string;
   title?: string;
@@ -832,6 +909,22 @@ function normalizeGiphyItem(item: GiphyItem) {
 app.get('/health', async () => {
   await prisma.$queryRaw`SELECT 1`;
   return { status: 'ok' };
+});
+
+app.get('/site-config', async () => siteConfig());
+
+app.get('/branding/:storedName', async (request, reply) => {
+  const { storedName } = request.params as { storedName: string };
+  if (!/^[a-f0-9-]+\.(jpg|png|webp|gif|avif|ico)$/.test(storedName)) {
+    return reply.code(404).send();
+  }
+  const filePath = path.join(config.UPLOAD_DIR, 'branding', storedName);
+  if (!fs.existsSync(filePath)) return reply.code(404).send();
+  const extension = path.extname(storedName);
+  reply.header('Content-Type', imageContentTypes[extension] ?? 'application/octet-stream');
+  reply.header('Cache-Control', 'public, max-age=86400');
+  reply.header('X-Content-Type-Options', 'nosniff');
+  return reply.send(fs.createReadStream(filePath));
 });
 
 app.get('/auth/install-state', async () => {
@@ -1049,7 +1142,11 @@ app.get('/admin/settings', { preHandler: [requireReady, requireSuperAdmin] }, as
 });
 
 app.put('/admin/settings', { preHandler: [requireReady, requireSuperAdmin] }, async (request) => {
-  const body = request.body as { publicRegistration?: boolean; maxUploadBytes?: number };
+  const body = request.body as {
+    publicRegistration?: boolean;
+    maxUploadBytes?: number;
+    defaultLanguage?: string;
+  };
   if (typeof body.publicRegistration === 'boolean') {
     await prisma.setting.upsert({
       where: { key: 'publicRegistration' },
@@ -1064,7 +1161,67 @@ app.put('/admin/settings', { preHandler: [requireReady, requireSuperAdmin] }, as
       update: { value: String(body.maxUploadBytes) },
     });
   }
+  if (body.defaultLanguage) {
+    await prisma.setting.upsert({
+      where: { key: 'defaultLanguage' },
+      create: { key: 'defaultLanguage', value: normalizeLanguageSetting(body.defaultLanguage) },
+      update: { value: normalizeLanguageSetting(body.defaultLanguage) },
+    });
+  }
   return { ok: true };
+});
+
+app.post('/admin/branding/:kind', { preHandler: [requireReady, requireSuperAdmin] }, async (request, reply) => {
+  const { kind } = request.params as { kind: keyof typeof brandingKinds };
+  const target = brandingKinds[kind];
+  if (!target) return reply.code(404).send({ error: 'Tipo de branding inválido' });
+  const file = await request.file({ limits: { fileSize: 12 * 1024 ** 2 } });
+  if (!file) return reply.code(400).send({ error: 'Escolha uma imagem' });
+  const allowed = new Map([
+    ['image/jpeg', '.jpg'],
+    ['image/png', '.png'],
+    ['image/webp', '.webp'],
+    ['image/gif', '.gif'],
+    ['image/avif', '.avif'],
+    ['image/x-icon', '.ico'],
+    ['image/vnd.microsoft.icon', '.ico'],
+  ]);
+  const extension = allowed.get(file.mimetype);
+  if (!extension) {
+    file.file.resume();
+    return reply.code(415).send({ error: 'Use uma imagem JPG, PNG, WebP, GIF, AVIF ou ICO' });
+  }
+  const directory = path.join(config.UPLOAD_DIR, target.directory);
+  fs.mkdirSync(directory, { recursive: true });
+  const storedName = `${randomUUID()}${extension}`;
+  const filePath = path.join(directory, storedName);
+  await pipeline(file.file, fs.createWriteStream(filePath));
+  if (file.file.truncated) {
+    fs.rmSync(filePath, { force: true });
+    return reply.code(413).send({ error: 'A imagem não pode exceder 12 MB' });
+  }
+  const previous = await prisma.setting.findUnique({ where: { key: target.settingKey } });
+  await prisma.setting.upsert({
+    where: { key: target.settingKey },
+    create: { key: target.settingKey, value: storedName },
+    update: { value: storedName },
+  });
+  if (previous?.value) {
+    fs.rmSync(path.join(directory, previous.value), { force: true });
+  }
+  return { config: await siteConfig() };
+});
+
+app.delete('/admin/branding/:kind', { preHandler: [requireReady, requireSuperAdmin] }, async (request, reply) => {
+  const { kind } = request.params as { kind: keyof typeof brandingKinds };
+  const target = brandingKinds[kind];
+  if (!target) return reply.code(404).send({ error: 'Tipo de branding inválido' });
+  const previous = await prisma.setting.findUnique({ where: { key: target.settingKey } });
+  await prisma.setting.deleteMany({ where: { key: target.settingKey } });
+  if (previous?.value) {
+    fs.rmSync(path.join(config.UPLOAD_DIR, target.directory, previous.value), { force: true });
+  }
+  return { config: await siteConfig() };
 });
 
 app.post('/admin/storage/cleanup', { preHandler: [requireReady, requireSuperAdmin] }, async () => {
@@ -1749,6 +1906,7 @@ app.get(
             },
           },
         },
+        reactions: { select: { emoji: true, userId: true } },
       },
       orderBy: { createdAt: 'desc' },
       take: 51,
@@ -1761,6 +1919,7 @@ app.get(
       messages: [...page].reverse().map((message) => ({
         ...message,
         replyTo: serializeReply(message.replyTo),
+        reactions: reactionPayload(message.reactions),
         author: publicUser({
           ...message.author,
           isSuperAdmin: false,
@@ -1903,12 +2062,14 @@ app.post(
             },
           },
         },
+        reactions: { select: { emoji: true, userId: true } },
       },
     });
     await prisma.directConversation.update({ where: { id }, data: { updatedAt: new Date() } });
     const responseMessage = {
       ...message,
       replyTo: serializeReply(message.replyTo),
+      reactions: reactionPayload(message.reactions),
       author: publicUser({
         ...message.author,
         isSuperAdmin: false,
@@ -1953,6 +2114,39 @@ app.delete(
     ]);
     io.to(`dm:${conversationId}`).emit('dm:message:deleted', { conversationId, messageId });
     return { ok: true };
+  },
+);
+
+app.post(
+  '/direct-conversations/:conversationId/messages/:messageId/reactions',
+  { preHandler: requireReady },
+  async (request, reply) => {
+    const { conversationId, messageId } = request.params as {
+      conversationId: string;
+      messageId: string;
+    };
+    const emoji = parseReactionBody(request.body);
+    if (!emoji) return reply.code(400).send({ error: 'Emoji inválido' });
+    if (!(await getDirectConversation(request.user!.id, conversationId))) {
+      return reply.code(403).send({ error: 'Sem acesso a esta conversa' });
+    }
+    const message = await prisma.directMessage.findFirst({
+      where: { id: messageId, conversationId },
+    });
+    if (!message) return reply.code(404).send({ error: 'Mensagem não encontrada' });
+    const existing = await prisma.directMessageReaction.findUnique({
+      where: { messageId_userId_emoji: { messageId, userId: request.user!.id, emoji } },
+    });
+    if (existing) {
+      await prisma.directMessageReaction.delete({ where: { id: existing.id } });
+    } else {
+      await prisma.directMessageReaction.create({
+        data: { messageId, userId: request.user!.id, emoji },
+      });
+    }
+    const updated = await serializeDirectMessage(messageId);
+    if (updated) io.to(`dm:${conversationId}`).emit('dm:message:updated', updated);
+    return { message: updated };
   },
 );
 
@@ -2033,7 +2227,7 @@ app.post(
     });
     token.addGrant({
       roomJoin: true,
-      room: `dm-${id}`,
+      room: callRoomName('direct', id),
       canPublish: true,
       canSubscribe: true,
     });
@@ -3062,6 +3256,7 @@ app.get('/channels/:id/messages', { preHandler: requireReady }, async (request, 
           author: { select: { id: true, username: true, avatarStoredName: true } },
         },
       },
+      reactions: { select: { emoji: true, userId: true } },
     },
     orderBy: { createdAt: 'desc' },
     take: 51,
@@ -3074,6 +3269,7 @@ app.get('/channels/:id/messages', { preHandler: requireReady }, async (request, 
     messages: [...page].reverse().map((message) => ({
       ...message,
       replyTo: serializeReply(message.replyTo),
+      reactions: reactionPayload(message.reactions),
       author: {
         id: message.author.id,
         username: displayUsername(message.author.username),
@@ -3113,6 +3309,7 @@ app.get('/channels/:id/search', { preHandler: requireReady }, async (request, re
           author: { select: { id: true, username: true, avatarStoredName: true } },
         },
       },
+      reactions: { select: { emoji: true, userId: true } },
     },
     orderBy: { createdAt: 'desc' },
     take: 300,
@@ -3124,6 +3321,7 @@ app.get('/channels/:id/search', { preHandler: requireReady }, async (request, re
       .map((message) => ({
         ...message,
         replyTo: serializeReply(message.replyTo),
+        reactions: reactionPayload(message.reactions),
         author: {
           id: message.author.id,
           username: displayUsername(message.author.username),
@@ -3164,11 +3362,13 @@ app.post('/channels/:id/messages', { preHandler: requireReady }, async (request,
           author: { select: { id: true, username: true, avatarStoredName: true } },
         },
       },
+      reactions: { select: { emoji: true, userId: true } },
     },
   });
   const responseMessage = {
     ...message,
     replyTo: serializeReply(message.replyTo),
+    reactions: reactionPayload(message.reactions),
     author: {
       id: message.author.id,
       username: displayUsername(message.author.username),
@@ -3207,6 +3407,59 @@ app.delete('/channels/:channelId/messages/:messageId', { preHandler: requireRead
   return { ok: true };
 });
 
+app.post('/channels/:channelId/messages/:messageId/reactions', { preHandler: requireReady }, async (request, reply) => {
+  const { channelId, messageId } = request.params as { channelId: string; messageId: string };
+  const emoji = parseReactionBody(request.body);
+  if (!emoji) return reply.code(400).send({ error: 'Emoji inválido' });
+  const channel = await prisma.channel.findUnique({ where: { id: channelId } });
+  if (!channel || !(await canUseChannel(request.user!.id, channel, 'READ_MESSAGES'))) {
+    return reply.code(403).send({ error: 'Sem acesso ao canal' });
+  }
+  const message = await prisma.message.findFirst({
+    where: { id: messageId, channelId },
+  });
+  if (!message) return reply.code(404).send({ error: 'Mensagem não encontrada' });
+  const existing = await prisma.messageReaction.findUnique({
+    where: { messageId_userId_emoji: { messageId, userId: request.user!.id, emoji } },
+  });
+  if (existing) {
+    await prisma.messageReaction.delete({ where: { id: existing.id } });
+  } else {
+    await prisma.messageReaction.create({
+      data: { messageId, userId: request.user!.id, emoji },
+    });
+  }
+  const updated = await prisma.message.findUnique({
+    where: { id: messageId },
+    include: {
+      author: { select: { id: true, username: true, avatarStoredName: true } },
+      uploads: true,
+      reactions: { select: { emoji: true, userId: true } },
+      replyTo: {
+        include: {
+          author: { select: { id: true, username: true, avatarStoredName: true } },
+        },
+      },
+    },
+  });
+  if (!updated) return reply.code(404).send({ error: 'Mensagem não encontrada' });
+  const responseMessage = {
+    ...updated,
+    replyTo: serializeReply(updated.replyTo),
+    reactions: reactionPayload(updated.reactions),
+    author: {
+      id: updated.author.id,
+      username: displayUsername(updated.author.username),
+      avatarUrl: updated.author.avatarStoredName
+        ? `/avatars/${updated.author.avatarStoredName}`
+        : null,
+    },
+    uploads: updated.uploads.map((upload) => ({ ...upload, size: Number(upload.size) })),
+  };
+  io.to(`channel:${channelId}`).emit('message:updated', responseMessage);
+  return { message: responseMessage };
+});
+
 app.post('/channels/:id/uploads', { preHandler: requireReady }, async (request, reply) => {
   const { id } = request.params as { id: string };
   const channel = await prisma.channel.findUnique({ where: { id } });
@@ -3226,6 +3479,55 @@ app.post('/channels/:id/uploads', { preHandler: requireReady }, async (request, 
     return reply.code(413).send({ error: `O ficheiro excede o limite de ${maxBytes} bytes` });
   }
   return reply.code(201).send({ upload });
+});
+
+app.post('/channels/:id/call/mute', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { userId } = request.body as { userId?: string };
+  if (!userId || userId === request.user!.id) {
+    return reply.code(400).send({ error: 'Participante inválido' });
+  }
+  const channel = await prisma.channel.findUnique({ where: { id } });
+  if (!channel || channel.type === 'TEXT') {
+    return reply.code(404).send({ error: 'Chamada não encontrada' });
+  }
+  if (!(await hasServerPermission(request.user!.id, channel.serverId, 'MUTE_MEMBERS'))) {
+    return reply.code(403).send({ error: 'Sem permissão para mutar membros' });
+  }
+  if (!(await canActOnMember(request.user!.id, userId, channel.serverId))) {
+    return reply.code(403).send({ error: 'Não pode moderar este membro' });
+  }
+  const muted = await muteParticipantMicrophone(callRoomName('server', id), userId);
+  await logModeration(channel.serverId, request.user!.id, 'CALL_MEMBER_MUTED', channel.name, userId);
+  io.to(`user:${userId}`).emit('call:force-muted', { kind: 'server', targetId: id });
+  io.to(`server:${channel.serverId}`).emit('call:participant:muted', { userId, channelId: id });
+  return { ok: true, muted };
+});
+
+app.post('/channels/:id/call/kick', { preHandler: requireReady }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { userId } = request.body as { userId?: string };
+  if (!userId || userId === request.user!.id) {
+    return reply.code(400).send({ error: 'Participante inválido' });
+  }
+  const channel = await prisma.channel.findUnique({ where: { id } });
+  if (!channel || channel.type === 'TEXT') {
+    return reply.code(404).send({ error: 'Chamada não encontrada' });
+  }
+  const canModerateCall =
+    await hasServerPermission(request.user!.id, channel.serverId, 'MUTE_MEMBERS')
+    || await hasServerPermission(request.user!.id, channel.serverId, 'MANAGE_CHANNELS');
+  if (!canModerateCall) {
+    return reply.code(403).send({ error: 'Sem permissão para expulsar da chamada' });
+  }
+  if (!(await canActOnMember(request.user!.id, userId, channel.serverId))) {
+    return reply.code(403).send({ error: 'Não pode moderar este membro' });
+  }
+  await livekitRooms.removeParticipant(callRoomName('server', id), userId).catch(() => undefined);
+  await leaveTrackedCall(userId);
+  await logModeration(channel.serverId, request.user!.id, 'CALL_MEMBER_KICKED', channel.name, userId);
+  io.to(`user:${userId}`).emit('call:force-left', { kind: 'server', targetId: id });
+  return { ok: true };
 });
 
 app.get('/cdn/:token', async (request, reply) => {
@@ -3309,6 +3611,7 @@ app.post('/channels/:id/call-token', { preHandler: requireReady }, async (reques
   if (!channel || channel.type === 'TEXT' || !(await canUseChannel(request.user!.id, channel, 'JOIN_CALL'))) {
     return reply.code(403).send({ error: 'Sem permissão para entrar na chamada' });
   }
+  const canSpeak = await canUseChannel(request.user!.id, channel, 'SPEAK_IN_CALL');
   const caller = await prisma.user.findUnique({
     where: { id: request.user!.id },
     select: { avatarStoredName: true },
@@ -3320,7 +3623,12 @@ app.post('/channels/:id/call-token', { preHandler: requireReady }, async (reques
       avatarUrl: caller?.avatarStoredName ? `/api/avatars/${caller.avatarStoredName}` : null,
     }),
   });
-  token.addGrant({ roomJoin: true, room: `channel-${id}`, canPublish: true, canSubscribe: true });
+  token.addGrant({
+    roomJoin: true,
+    room: callRoomName('server', id),
+    canPublish: canSpeak,
+    canSubscribe: true,
+  });
   return { token: await token.toJwt() };
 });
 
@@ -3364,15 +3672,17 @@ io.on('connection', (socket) => {
   });
   socket.on('call:join', async (call: { label?: string; kind?: string; targetId?: string }) => {
     if (!call?.label || !call.targetId || !['server', 'direct'].includes(call.kind || '')) return;
-    const allowed = call.kind === 'server'
-      ? Boolean(await prisma.channel.findFirst({
-        where: {
-          id: call.targetId,
-          type: { not: 'TEXT' },
-          server: { members: { some: { userId: connectedUserId } } },
-        },
-      }))
-      : Boolean(await getDirectConversation(connectedUserId, call.targetId));
+    let allowed = false;
+    if (call.kind === 'server') {
+      const channel = await prisma.channel.findUnique({ where: { id: call.targetId } });
+      allowed = Boolean(
+        channel
+        && channel.type !== 'TEXT'
+        && await canUseChannel(connectedUserId, channel, 'JOIN_CALL'),
+      );
+    } else {
+      allowed = Boolean(await getDirectConversation(connectedUserId, call.targetId));
+    }
     if (!allowed) return;
     await leaveTrackedCall(connectedUserId);
     const activeCall = {

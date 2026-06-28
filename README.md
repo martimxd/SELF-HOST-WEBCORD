@@ -20,6 +20,7 @@ Open source project distributed under the MIT license.
 - Persistent uploads with random CDN URLs.
 - Image, video, and audio previews.
 - Replies and message forwarding across channels and DMs.
+- Emoji reactions on messages.
 - GIPHY search with configurable content rating.
 - Per-user GIF favorites that can be saved from messages and reused.
 - Personal PNG, WEBP, and GIF stickers.
@@ -28,8 +29,9 @@ Open source project distributed under the MIT license.
 - Cards for documents, files, APKs, and EXEs.
 - LiveKit calls with screen sharing.
 - Call mute, deafen, camera, and screen-share controls.
+- Server call moderation with admin mute/kick controls and right-click participant volume.
 - Server settings, ownership transfer, member kick/ban/unban, nicknames, timeouts, roles, permissions, channel privacy/read-only flags, and moderation logs.
-- Account administration and upload limits.
+- Account administration, upload limits, default site language, favicon, site icon, and login background customization.
 - Image compression, upload deduplication, and lightweight media thumbnails.
 - Deleted accounts are anonymized as `Deleted User` while preserving conversation history.
 - Interface in Portuguese, English, and French.
@@ -150,6 +152,7 @@ Main `.env` variables:
 | `WEB_PORT` | Local site port, usually `3000` |
 | `LIVEKIT_API_KEY` | Internal LiveKit identifier |
 | `LIVEKIT_API_SECRET` | LiveKit secret key |
+| `LIVEKIT_URL` | Internal API-to-LiveKit HTTP URL, default `http://livekit:7880` in Docker |
 | `GIPHY_API_KEY` | Optional GIPHY API key used by the GIF picker |
 | `GIPHY_RATING` | Maximum GIPHY content rating, such as `pg-13` |
 | `GIPHY_COUNTRY_CODE` | Two-letter country code sent to GIPHY |
@@ -174,6 +177,10 @@ To enable GIF search, create an API key in the
 Uploaded files are stored once when an identical file hash already exists. Images are compressed when `MEDIA_OPTIMIZATION_ENABLED=true`; WebCord keeps the original visual format when practical and only replaces the stored file if the optimized result is smaller. GIFs and videos remain streamable, and supported media receives lightweight thumbnails under the uploads volume.
 
 Upload size is controlled in the admin settings by `maxUploadBytes` and defaults to 2 GB. The environment variables above control image quality and thumbnail size. Optional cleanup only removes orphan preview-cache files, not message attachments, so old messages and existing uploads remain compatible.
+
+## Admin branding and default language
+
+The global admin console is available only to the super-admin account. From there you can set the default site language for users who have not chosen a personal language yet, and optionally upload a site icon, favicon, and login-page background. If an image is reset or never uploaded, WebCord keeps its built-in default.
 
 ## Access methods
 

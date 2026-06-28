@@ -1,4 +1,5 @@
-import { Forward, Heart, Phone, Reply, Trash2 } from 'lucide-react';
+import { useState } from 'react';
+import { Forward, Heart, Phone, Reply, SmilePlus, Trash2 } from 'lucide-react';
 import type { Message, User } from '../types';
 import { MessageContent } from './MessageContent';
 import { UserAvatar } from './UserAvatar';
@@ -42,23 +43,29 @@ export function extractGifFavorite(content: string) {
 
 export function MessageRow({
   message,
+  currentUserId = '',
   onReply,
   onForward,
   onProfile,
   authorDisplayName,
   onDelete,
   onFavoriteGif,
+  onReact,
 }: {
   message: Message;
+  currentUserId?: string;
   onReply: (message: Message) => void;
   onForward: (message: Message) => void;
   onProfile?: (user: Pick<User, 'id' | 'username' | 'avatarUrl' | 'status'>) => void;
   authorDisplayName?: string;
   onDelete?: (message: Message) => void;
   onFavoriteGif?: (gif: NonNullable<ReturnType<typeof extractGifFavorite>>) => void;
+  onReact?: (message: Message, emoji: string) => void;
 }) {
   const { t } = useI18n();
+  const [reactionPickerOpen, setReactionPickerOpen] = useState(false);
   const gifFavorite = extractGifFavorite(message.content);
+  const quickReactions = ['🙂', '👍', '❤️', '😂', '😮', '🔥'];
   const callLog = message.content.match(
     /^\[call-log started="([^"]+)" ended="([^"]*)" duration="(\d+)"\]$/,
   );
@@ -109,10 +116,52 @@ export function MessageRow({
         </button>
         <time>{new Date(message.createdAt).toLocaleString('pt-PT')}</time>
         <MessageContent content={message.content} />
+        {(message.reactions?.length ?? 0) > 0 && (
+          <div className="message-reactions">
+            {message.reactions?.map((reaction) => (
+              <button
+                type="button"
+                className={reaction.userIds.includes(currentUserId) ? 'reacted' : ''}
+                key={reaction.emoji}
+                onClick={() => onReact?.(message, reaction.emoji)}
+              >
+                <span>{reaction.emoji}</span>
+                <strong>{reaction.count}</strong>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
       <div className="message-actions">
         <button onClick={() => onReply(message)} title={t('reply')}><Reply size={16} /></button>
         <button onClick={() => onForward(message)} title={t('forward')}><Forward size={16} /></button>
+        {onReact && (
+          <span className="message-reaction-action">
+            <button
+              type="button"
+              onClick={() => setReactionPickerOpen((current) => !current)}
+              title={t('reactToMessage')}
+            >
+              <SmilePlus size={16} />
+            </button>
+            {reactionPickerOpen && (
+              <span className="reaction-picker">
+                {quickReactions.map((emoji) => (
+                  <button
+                    type="button"
+                    key={emoji}
+                    onClick={() => {
+                      onReact(message, emoji);
+                      setReactionPickerOpen(false);
+                    }}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </span>
+            )}
+          </span>
+        )}
         {gifFavorite && onFavoriteGif && (
           <button onClick={() => onFavoriteGif(gifFavorite)} title={t('favoriteGif')}><Heart size={16} /></button>
         )}

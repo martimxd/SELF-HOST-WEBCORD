@@ -49,12 +49,14 @@ model User {
   serverInvites       ServerInvite[]
   friendInvite        FriendInvite?
   messages            Message[]
+  messageReactions    MessageReaction[]
   uploads             Upload[]
   directConversationsA DirectConversation[] @relation("DirectUserA")
   directConversationsB DirectConversation[] @relation("DirectUserB")
   ownedDirectConversations DirectConversation[] @relation("DirectConversationOwner")
   directMemberships   DirectConversationMember[]
   directMessages       DirectMessage[]
+  directMessageReactions DirectMessageReaction[]
   sentFriendships      Friendship[] @relation("FriendshipRequester")
   receivedFriendships  Friendship[] @relation("FriendshipAddressee")
   blocksCreated         UserBlock[]  @relation("Blocker")
@@ -165,9 +167,24 @@ model Message {
   replyTo   Message?  @relation("MessageReplies", fields: [replyToId], references: [id])
   replies   Message[] @relation("MessageReplies")
   uploads   Upload[]
+  reactions MessageReaction[]
   createdAt DateTime  @default(now())
 
   @@index([channelId, createdAt])
+}
+
+model MessageReaction {
+  id        String   @id @default(cuid())
+  emoji     String
+  messageId String
+  userId    String
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([messageId, userId, emoji])
+  @@index([messageId])
+  @@index([userId])
 }
 
 model Role {
@@ -305,9 +322,24 @@ model DirectMessage {
   forwardedFrom  String?
   replyTo        DirectMessage?  @relation("DirectMessageReplies", fields: [replyToId], references: [id])
   replies        DirectMessage[] @relation("DirectMessageReplies")
+  reactions      DirectMessageReaction[]
 
   @@index([conversationId, createdAt])
   @@index([replyToId])
+}
+
+model DirectMessageReaction {
+  id        String   @id @default(cuid())
+  emoji     String
+  messageId String
+  userId    String
+  message   DirectMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([messageId, userId, emoji])
+  @@index([messageId])
+  @@index([userId])
 }
 
 model UserBlock {

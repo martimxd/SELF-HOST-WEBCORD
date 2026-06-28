@@ -48,22 +48,22 @@ const socket = io(import.meta.env.VITE_SOCKET_URL || window.location.origin, {
   autoConnect: false,
   withCredentials: true,
 });
-const permissionOptions: Array<{ id: ServerPermission; label: string }> = [
-  { id: 'ADMINISTRATOR', label: 'Administrador' },
-  { id: 'MANAGE_SERVER', label: 'Gerir servidor' },
-  { id: 'MANAGE_CHANNELS', label: 'Gerir canais' },
-  { id: 'MANAGE_ROLES', label: 'Gerir cargos' },
-  { id: 'KICK_MEMBERS', label: 'Expulsar membros' },
-  { id: 'BAN_MEMBERS', label: 'Banir membros' },
-  { id: 'MANAGE_MESSAGES', label: 'Gerir mensagens' },
-  { id: 'MENTION_EVERYONE', label: 'Mencionar everyone' },
-  { id: 'SEND_MESSAGES', label: 'Enviar mensagens' },
-  { id: 'READ_MESSAGES', label: 'Ler mensagens' },
-  { id: 'ATTACH_FILES', label: 'Anexar ficheiros' },
-  { id: 'JOIN_CALL', label: 'Entrar em call' },
-  { id: 'SPEAK_IN_CALL', label: 'Falar em call' },
-  { id: 'MUTE_MEMBERS', label: 'Mutar membros' },
-  { id: 'DEAFEN_MEMBERS', label: 'Deafen membros' },
+const permissionOptions: Array<{ id: ServerPermission; labelKey: string }> = [
+  { id: 'ADMINISTRATOR', labelKey: 'permissionAdministrator' },
+  { id: 'MANAGE_SERVER', labelKey: 'permissionManageServer' },
+  { id: 'MANAGE_CHANNELS', labelKey: 'permissionManageChannels' },
+  { id: 'MANAGE_ROLES', labelKey: 'permissionManageRoles' },
+  { id: 'KICK_MEMBERS', labelKey: 'permissionKickMembers' },
+  { id: 'BAN_MEMBERS', labelKey: 'permissionBanMembers' },
+  { id: 'MANAGE_MESSAGES', labelKey: 'permissionManageMessages' },
+  { id: 'MENTION_EVERYONE', labelKey: 'permissionMentionEveryone' },
+  { id: 'SEND_MESSAGES', labelKey: 'permissionSendMessages' },
+  { id: 'READ_MESSAGES', labelKey: 'permissionReadMessages' },
+  { id: 'ATTACH_FILES', labelKey: 'permissionAttachFiles' },
+  { id: 'JOIN_CALL', labelKey: 'permissionJoinCall' },
+  { id: 'SPEAK_IN_CALL', labelKey: 'permissionSpeakInCall' },
+  { id: 'MUTE_MEMBERS', labelKey: 'permissionMuteMembers' },
+  { id: 'DEAFEN_MEMBERS', labelKey: 'permissionDeafenMembers' },
 ];
 
 function ServerRail({
@@ -81,10 +81,11 @@ function ServerRail({
   onSelect: (server: Server) => void;
   onCreate: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <aside className="server-rail">
       <div className="brand-mark">W</div>
-      <button className="server-icon dm-icon" onClick={onDms} title="Mensagens diretas">
+      <button className="server-icon dm-icon" onClick={onDms} title={t('directMessages')}>
         <MessageCircle size={21} />
         {totalDmUnread > 0 && <span className="notification-badge">{Math.min(totalDmUnread, 99)}</span>}
       </button>
@@ -100,7 +101,7 @@ function ServerRail({
             : item.name.slice(0, 2).toUpperCase()}
         </button>
       ))}
-      <button className="server-icon add" onClick={onCreate} title="Criar servidor">
+      <button className="server-icon add" onClick={onCreate} title={t('createServer')}>
         <Plus size={20} />
       </button>
     </aside>
@@ -157,6 +158,10 @@ export function App() {
   const canManageMessages = Boolean(membership && (hasPermission('MANAGE_MESSAGES') || ['OWNER', 'ADMIN', 'MODERATOR'].includes(membership.role)));
   const canKickMembers = Boolean(membership && (hasPermission('KICK_MEMBERS') || ['OWNER', 'ADMIN', 'MODERATOR'].includes(membership.role)));
   const canBanMembers = Boolean(membership && (hasPermission('BAN_MEMBERS') || ['OWNER', 'ADMIN', 'MODERATOR'].includes(membership.role)));
+  const canModerateCall = Boolean(
+    membership
+    && (hasPermission('MUTE_MEMBERS') || hasPermission('MANAGE_CHANNELS') || ['OWNER', 'ADMIN'].includes(membership.role)),
+  );
 
   const loadServers = useCallback(async () => {
     const result = await api<{ servers: Server[] }>('/servers');
@@ -401,11 +406,20 @@ export function App() {
         setMessages((current) => current.filter((message) => message.id !== messageId));
       }
     };
+    const onMessageUpdated = (message: Message) => {
+      if (message.channelId === channelId) {
+        setMessages((current) =>
+          current.map((item) => item.id === message.id ? message : item),
+        );
+      }
+    };
     socket.on('message:new', onMessage);
     socket.on('message:deleted', onMessageDeleted);
+    socket.on('message:updated', onMessageUpdated);
     return () => {
       socket.off('message:new', onMessage);
       socket.off('message:deleted', onMessageDeleted);
+      socket.off('message:updated', onMessageUpdated);
     };
   }, [channelId, channel?.type]);
 
@@ -458,7 +472,7 @@ export function App() {
       });
       const link = `${window.location.origin}/?serverInvite=${result.token}`;
       await copyText(link);
-      setNotice('Link de convite do servidor copiado');
+      setNotice(t('serverInviteCopied'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -473,7 +487,7 @@ export function App() {
 
   const createChannel = async (type: Channel['type']) => {
     if (!server) return;
-    const name = prompt('Nome do canal');
+    const name = prompt(t('channelName'));
     if (!name) return;
     const { channel } = await api<{ channel: Channel }>(`/servers/${server.id}/channels`, {
       method: 'POST',
@@ -496,7 +510,7 @@ export function App() {
         body: JSON.stringify({ name: serverEditName, description: serverEditDescription }),
       });
       await loadServers();
-      setNotice('Alteração aplicada');
+      setNotice(t('changeApplied'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -528,11 +542,11 @@ export function App() {
   };
 
   const deleteChannel = async (target: Channel) => {
-    if (!confirm(`Apagar o canal #${target.name}?`)) return;
+    if (!confirm(`${t('deleteChannelConfirm')} #${target.name}?`)) return;
     try {
       await api(`/channels/${target.id}`, { method: 'DELETE' });
       await loadServers();
-      setNotice('Canal apagado');
+      setNotice(t('channelDeleted'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -545,22 +559,22 @@ export function App() {
         body: JSON.stringify(patch),
       });
       await loadServers();
-      setNotice('Canal atualizado');
+      setNotice(t('channelUpdated'));
     } catch (err) {
       setError((err as Error).message);
     }
   };
 
   const editChannel = async (target: Channel) => {
-    const name = prompt('Nome do canal', target.name);
+    const name = prompt(t('channelName'), target.name);
     if (!name) return;
-    const category = prompt('Categoria do canal', target.category || '');
+    const category = prompt(t('channelCategory'), target.category || '');
     await updateChannel(target, {
       name,
       category: category || null,
-      isPrivate: confirm('Canal privado? OK para sim, Cancelar para não.'),
+      isPrivate: confirm(t('privateChannelConfirm')),
       isReadOnly: target.type === 'TEXT'
-        ? confirm('Canal só leitura? OK para sim, Cancelar para não.')
+        ? confirm(t('readOnlyChannelConfirm'))
         : false,
     });
   };
@@ -586,10 +600,25 @@ export function App() {
   };
 
   const deleteMessage = async (message: Message) => {
-    if (!channel || !confirm('Apagar esta mensagem?')) return;
+    if (!channel || !confirm(t('deleteMessageConfirm'))) return;
     try {
       await api(`/channels/${channel.id}/messages/${message.id}`, { method: 'DELETE' });
       setMessages((current) => current.filter((item) => item.id !== message.id));
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const reactToMessage = async (message: Message, emoji: string) => {
+    if (!channel) return;
+    try {
+      const result = await api<{ message: Message }>(
+        `/channels/${channel.id}/messages/${message.id}/reactions`,
+        { method: 'POST', body: JSON.stringify({ emoji }) },
+      );
+      setMessages((current) =>
+        current.map((item) => item.id === message.id ? result.message : item),
+      );
     } catch (err) {
       setError((err as Error).message);
     }
@@ -603,7 +632,7 @@ export function App() {
         body: JSON.stringify({ role }),
       });
       await loadServers();
-      setNotice('Cargo atualizado');
+      setNotice(t('roleUpdated'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -625,7 +654,7 @@ export function App() {
       setRoleName('');
       setRolePermissions(['READ_MESSAGES', 'SEND_MESSAGES']);
       await loadServers();
-      setNotice('Cargo criado');
+      setNotice(t('roleCreated'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -633,27 +662,27 @@ export function App() {
 
   const editRole = async (role: ServerRole) => {
     if (!server) return;
-    const name = prompt('Nome do cargo', role.name);
+    const name = prompt(t('roleName'), role.name);
     if (!name) return;
-    const color = prompt('Cor HEX do cargo', role.color) || role.color;
+    const color = prompt(t('roleColor'), role.color) || role.color;
     try {
       await api(`/servers/${server.id}/roles/${role.id}`, {
         method: 'PATCH',
         body: JSON.stringify({ name, color }),
       });
       await loadServers();
-      setNotice('Cargo atualizado');
+      setNotice(t('roleUpdated'));
     } catch (err) {
       setError((err as Error).message);
     }
   };
 
   const deleteRole = async (role: ServerRole) => {
-    if (!server || !confirm(`Apagar o cargo ${role.name}?`)) return;
+    if (!server || !confirm(`${t('deleteRoleConfirm')} ${role.name}?`)) return;
     try {
       await api(`/servers/${server.id}/roles/${role.id}`, { method: 'DELETE' });
       await loadServers();
-      setNotice('Cargo apagado');
+      setNotice(t('roleDeleted'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -667,7 +696,7 @@ export function App() {
         body: JSON.stringify({ roleIds }),
       });
       await loadServers();
-      setNotice('Cargos do membro atualizados');
+      setNotice(t('memberRolesUpdated'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -675,7 +704,7 @@ export function App() {
 
   const updateMemberNickname = async (userId: string, currentNickname?: string | null) => {
     if (!server) return;
-    const nickname = prompt('Nickname neste servidor', currentNickname || '');
+    const nickname = prompt(t('serverNickname'), currentNickname || '');
     if (nickname === null) return;
     try {
       await api(`/servers/${server.id}/members/${userId}`, {
@@ -683,7 +712,7 @@ export function App() {
         body: JSON.stringify({ nickname: nickname || null }),
       });
       await loadServers();
-      setNotice('Nickname atualizado');
+      setNotice(t('nicknameUpdated'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -691,7 +720,7 @@ export function App() {
 
   const timeoutMember = async (userId: string) => {
     if (!server) return;
-    const minutes = prompt('Timeout em minutos. Deixa vazio para remover timeout.', '10');
+    const minutes = prompt(t('timeoutPrompt'), '10');
     if (minutes === null) return;
     const value = Number(minutes);
     const until = minutes.trim() && Number.isFinite(value)
@@ -700,38 +729,38 @@ export function App() {
     try {
       await api(`/servers/${server.id}/members/${userId}`, {
         method: 'PATCH',
-        body: JSON.stringify({ until, reason: until ? `Timeout ${minutes} minutos` : 'Timeout removido' }),
+        body: JSON.stringify({ until, reason: until ? `Timeout ${minutes} ${t('minutes')}` : t('timeoutRemoved') }),
       });
       await loadServers();
-      setNotice(until ? 'Timeout aplicado' : 'Timeout removido');
+      setNotice(until ? t('timeoutApplied') : t('timeoutRemoved'));
     } catch (err) {
       setError((err as Error).message);
     }
   };
 
   const kickMember = async (userId: string, username: string) => {
-    if (!server || !confirm(`Expulsar @${username} deste servidor?`)) return;
+    if (!server || !confirm(`${t('kickMemberConfirm')} @${username}?`)) return;
     try {
       await api(`/servers/${server.id}/members/${userId}/kick`, {
         method: 'POST',
-        body: JSON.stringify({ reason: 'Expulso pelo painel de gestão' }),
+        body: JSON.stringify({ reason: t('kickedFromManagement') }),
       });
       await loadServers();
-      setNotice('Membro expulso');
+      setNotice(t('memberKicked'));
     } catch (err) {
       setError((err as Error).message);
     }
   };
 
   const banMember = async (userId: string, username: string) => {
-    if (!server || !confirm(`Banir @${username} deste servidor?`)) return;
+    if (!server || !confirm(`${t('banMemberConfirm')} @${username}?`)) return;
     try {
       await api(`/servers/${server.id}/members/${userId}/ban`, {
         method: 'POST',
-        body: JSON.stringify({ reason: 'Banido pelo painel de gestão' }),
+        body: JSON.stringify({ reason: t('bannedFromManagement') }),
       });
       await loadServers();
-      setNotice('Membro banido');
+      setNotice(t('memberBanned'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -742,19 +771,19 @@ export function App() {
     try {
       await api(`/servers/${server.id}/bans/${userId}`, { method: 'DELETE' });
       await loadServers();
-      setNotice('Ban removido');
+      setNotice(t('banRemoved'));
     } catch (err) {
       setError((err as Error).message);
     }
   };
 
   const leaveServer = async () => {
-    if (!server || !confirm(`Sair do servidor ${server.name}?`)) return;
+    if (!server || !confirm(`${t('leaveServerConfirm')} ${server.name}?`)) return;
     try {
       await api(`/servers/${server.id}/members/me`, { method: 'DELETE' });
       setServerManagementOpen(false);
       await loadServers();
-      setNotice('Saíste do servidor');
+      setNotice(t('leftServer'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -763,7 +792,7 @@ export function App() {
   const deleteServer = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!server || !serverDeletePassword) return;
-    if (!confirm(`Apagar definitivamente o servidor ${server.name}?`)) return;
+    if (!confirm(`${t('deleteServerConfirm')} ${server.name}?`)) return;
     try {
       await api(`/servers/${server.id}`, {
         method: 'DELETE',
@@ -772,7 +801,7 @@ export function App() {
       setServerDeletePassword('');
       setServerManagementOpen(false);
       await loadServers();
-      setNotice('Servidor apagado');
+      setNotice(t('serverDeleted'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -781,7 +810,7 @@ export function App() {
   const transferOwnership = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!server || !ownershipTargetId || !ownershipPassword) return;
-    if (!confirm('Transferir a posse deste servidor? Tu passarás a administrador.')) return;
+    if (!confirm(t('transferOwnershipConfirm'))) return;
     try {
       await api(`/servers/${server.id}/transfer-ownership`, {
         method: 'POST',
@@ -793,7 +822,7 @@ export function App() {
       setOwnershipPassword('');
       setOwnershipTargetId('');
       await loadServers();
-      setNotice('Posse do servidor transferida');
+      setNotice(t('ownershipTransferred'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -848,7 +877,7 @@ export function App() {
         method: 'POST',
         body: JSON.stringify(gif),
       });
-      setNotice(t('favoriteGif'));
+      setNotice(t('gifSavedFavorites'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -946,26 +975,26 @@ export function App() {
             <strong>{server?.name || 'WebCord'}</strong>
             <small>{server?.description || t('communitySpace')}</small>
           </div>
-          {server && <button className="server-invite-button" onClick={copyServerInvite} title="Copiar link de convite"><Link2 size={17} /></button>}
+          {server && <button className="server-invite-button" onClick={copyServerInvite} title={t('copyInvite')}><Link2 size={17} /></button>}
           {server && membership && (
-            <button className="server-invite-button" onClick={() => setServerManagementOpen(true)} title="Gerir servidor">
+            <button className="server-invite-button" onClick={() => setServerManagementOpen(true)} title={t('manageServer')}>
               <UserCog size={17} />
             </button>
           )}
         </header>
         {server && canCustomizeServer && (
           <div className="server-image-actions">
-            <label title="Alterar imagem do servidor"><Camera size={15} /> Imagem<input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" onChange={(event) => event.target.files?.[0] && uploadServerImage(event.target.files[0])} /></label>
-            {server.imageUrl && <button title="Remover imagem do servidor" onClick={removeServerImage}><Trash2 size={15} /></button>}
+            <label title={t('changeServerImage')}><Camera size={15} /> {t('serverImage')}<input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" onChange={(event) => event.target.files?.[0] && uploadServerImage(event.target.files[0])} /></label>
+            {server.imageUrl && <button title={t('removeServerImage')} onClick={removeServerImage}><Trash2 size={15} /></button>}
           </div>
         )}
         <div className="section-title">
           <span>{t('channels')}</span>
           {server && canCreateChannels && (
             <div className="channel-create-actions">
-              <button onClick={() => createChannel('TEXT')} title="Criar canal de texto"><Hash size={15} /></button>
-              <button onClick={() => createChannel('VOICE')} title="Criar canal de voz"><Mic size={15} /></button>
-              <button onClick={() => createChannel('VIDEO')} title="Criar canal de vídeo"><Video size={15} /></button>
+              <button onClick={() => createChannel('TEXT')} title={t('createChannelText')}><Hash size={15} /></button>
+              <button onClick={() => createChannel('VOICE')} title={t('createChannelVoice')}><Mic size={15} /></button>
+              <button onClick={() => createChannel('VIDEO')} title={t('createChannelVideo')}><Video size={15} /></button>
             </div>
           )}
         </div>
@@ -983,7 +1012,7 @@ export function App() {
                 <span>{item.name}</span>
               </button>
               {canCreateChannels && (
-                <button className="channel-delete" onClick={() => deleteChannel(item)} title="Apagar canal">
+                <button className="channel-delete" onClick={() => deleteChannel(item)} title={t('deleteChannel')}>
                   <Trash2 size={14} />
                 </button>
               )}
@@ -994,10 +1023,10 @@ export function App() {
           <button className="avatar-button" onClick={() => showProfile(user.username)}><UserAvatar user={user} /></button>
           <div>
             <button className="username-button" onClick={() => showProfile(user.username)}><strong>{user.username}</strong></button>
-            <small>{user.status === 'offline' ? 'offline' : 'online'}</small>
+            <small>{user.status === 'offline' ? t('offline') : t('online')}</small>
             {user.activeCall && <small className="active-call-status"><Mic size={11} /> {user.activeCall.label}</small>}
           </div>
-          {user.isSuperAdmin && <button title="Administração" onClick={() => setView('admin')}><Shield size={17} /></button>}
+          {user.isSuperAdmin && <button title={t('globalAdmin')} onClick={() => setView('admin')}><Shield size={17} /></button>}
           <button title={t('settings')} onClick={() => setView('settings')}><Settings size={17} /></button>
           <button title={t('logout')} onClick={logout}><LogOut size={17} /></button>
         </div>
@@ -1007,10 +1036,10 @@ export function App() {
         <header className="chat-header">
           <button className="mobile-menu" onClick={() => setMobileOpen(!mobileOpen)}><Menu /></button>
           {channel?.type === 'TEXT' ? <Hash /> : <Mic />}
-          <strong>{channel?.name || 'Bem-vindo'}</strong>
+          <strong>{channel?.name || t('welcome')}</strong>
           <span>{channel?.type === 'TEXT' ? t('communityChat') : t('callRoom')}</span>
-          <button className="members-toggle push-right" onClick={() => setShowMembers((current) => !current)} title="Membros"><Users /></button>
-          {channel?.type === 'TEXT' && <button className="members-toggle" onClick={() => setSearchOpen((current) => !current)} title="Pesquisar"><Search /></button>}
+          <button className="members-toggle push-right" onClick={() => setShowMembers((current) => !current)} title={t('members')}><Users /></button>
+          {channel?.type === 'TEXT' && <button className="members-toggle" onClick={() => setSearchOpen((current) => !current)} title={t('search')}><Search /></button>}
         </header>
 
         {!server ? (
@@ -1029,6 +1058,9 @@ export function App() {
               socket={socket}
               callKind="server"
               callTargetId={channel.id}
+              canModerateCall={canModerateCall}
+              muteEndpoint={`/channels/${channel.id}/call/mute`}
+              kickEndpoint={`/channels/${channel.id}/call/kick`}
             />
           )
         ) : (
@@ -1041,17 +1073,19 @@ export function App() {
               </div>
               {messageCursor && (
                 <button className="load-older" disabled={loadingOlder} onClick={loadOlderMessages}>
-                  {loadingOlder ? 'A carregar…' : 'Carregar mensagens anteriores'}
+                  {loadingOlder ? t('loading') : t('loadOlderMessages')}
                 </button>
               )}
               {messages.map((message) => (
                 <MessageRow
                   key={message.id}
                   message={message}
+                  currentUserId={user.id}
                   onReply={setReplyingTo}
                   onForward={setForwardingMessage}
                   onProfile={(author) => showProfile(author.username)}
                   onFavoriteGif={favoriteGif}
+                  onReact={reactToMessage}
                   onDelete={
                     message.author.id === user.id || canManageMessages
                       ? deleteMessage
@@ -1070,12 +1104,12 @@ export function App() {
               )}
               {replyingTo && (
                 <div className="replying-banner">
-                  <span>A responder a <strong>@{replyingTo.author.username}</strong></span>
+                  <span>{t('replyingTo')} <strong>@{replyingTo.author.username}</strong></span>
                   <button onClick={() => setReplyingTo(null)}>×</button>
                 </div>
               )}
               <form className="composer" onSubmit={send}>
-                <label className="attach" title="Enviar ficheiro">
+                <label className="attach" title={t('attachFile')}>
                   <Plus />
                   <input type="file" onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])} />
                 </label>
@@ -1100,7 +1134,7 @@ export function App() {
       </main>
       {showMembers && server && (
         <aside className="member-panel">
-          <header><strong>Membros</strong><span>{server.members.length}</span></header>
+          <header><strong>{t('members')}</strong><span>{server.members.length}</span></header>
           <div className="member-list">
             {server.members
               .slice()
@@ -1110,7 +1144,7 @@ export function App() {
                   <UserAvatar user={member.user} />
                   <span>
                     <strong>@{member.user.username}</strong>
-                    <small>{member.user.status === 'online' ? 'Online' : 'Offline'} · {member.role.toLowerCase()}</small>
+                    <small>{member.user.status === 'online' ? t('online') : t('offline')} · {member.role.toLowerCase()}</small>
                     {member.user.activeCall && <small className="active-call-status"><Mic size={11} /> {member.user.activeCall.label}</small>}
                   </span>
                 </button>
@@ -1137,7 +1171,7 @@ export function App() {
               body: JSON.stringify({ username: profile.username }),
             });
             setProfile((current) => current ? { ...current, relationship: 'pending' } : current);
-            setNotice('Pedido de amizade enviado');
+            setNotice(t('friendRequestSent'));
           } : undefined}
         />
       )}
@@ -1155,14 +1189,14 @@ export function App() {
             <button className="modal-close" onClick={() => setServerManagementOpen(false)}><X /></button>
             <span className="eyebrow">{t('serverManagement')}</span>
             <h2>{server.name}</h2>
-            <p className="muted">O teu cargo: {membership.role.toLowerCase()}</p>
+            <p className="muted">{t('yourRole')}: {membership.role.toLowerCase()}</p>
 
             {canCustomizeServer && (
               <>
                 <h3>{t('editServer')}</h3>
                 <form className="management-form server-details-form" onSubmit={updateServerDetails}>
                   <input value={serverEditName} onChange={(event) => setServerEditName(event.target.value)} minLength={2} maxLength={80} />
-                  <input value={serverEditDescription} onChange={(event) => setServerEditDescription(event.target.value)} maxLength={500} placeholder="Descrição" />
+                  <input value={serverEditDescription} onChange={(event) => setServerEditDescription(event.target.value)} maxLength={500} placeholder={t('description')} />
                   <button className="secondary-button">{t('save')}</button>
                 </form>
                 <div className="server-image-actions modal-server-image-actions">
@@ -1170,7 +1204,7 @@ export function App() {
                     <Camera size={15} /> {t('serverImage')}
                     <input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" onChange={(event) => event.target.files?.[0] && uploadServerImage(event.target.files[0])} />
                   </label>
-                  {server.imageUrl && <button title="Remover imagem do servidor" onClick={removeServerImage}><Trash2 size={15} /></button>}
+                  {server.imageUrl && <button title={t('removeServerImage')} onClick={removeServerImage}><Trash2 size={15} /></button>}
                 </div>
               </>
             )}
@@ -1187,8 +1221,8 @@ export function App() {
                         <small>
                           {item.type.toLowerCase()}
                           {item.category ? ` · ${item.category}` : ''}
-                          {item.isPrivate ? ' · privado' : ''}
-                          {item.isReadOnly ? ' · só leitura' : ''}
+                          {item.isPrivate ? ` · ${t('private')}` : ''}
+                          {item.isReadOnly ? ` · ${t('readOnly')}` : ''}
                         </small>
                       </span>
                       <button className="secondary-button compact-action" onClick={() => moveChannel(item, -1)}>↑</button>
@@ -1203,9 +1237,9 @@ export function App() {
 
             {canManageRoles && (
               <>
-                <h3>Cargos e permissões</h3>
+                <h3>{t('rolesAndPermissions')}</h3>
                 <form className="role-create-form" onSubmit={createRole}>
-                  <input value={roleName} onChange={(event) => setRoleName(event.target.value)} placeholder="Nome do cargo" minLength={1} maxLength={80} />
+                  <input value={roleName} onChange={(event) => setRoleName(event.target.value)} placeholder={t('roleName')} minLength={1} maxLength={80} />
                   <input type="color" value={roleColor} onChange={(event) => setRoleColor(event.target.value)} />
                   <div className="permission-grid">
                     {permissionOptions.map((permission) => (
@@ -1221,11 +1255,11 @@ export function App() {
                             );
                           }}
                         />
-                        <span>{permission.label}</span>
+                        <span>{t(permission.labelKey)}</span>
                       </label>
                     ))}
                   </div>
-                  <button className="secondary-button"><Plus size={16} /> Criar cargo</button>
+                  <button className="secondary-button"><Plus size={16} /> {t('createRole')}</button>
                 </form>
                 <div className="server-member-management role-list">
                   {server.roles?.map((role) => (
@@ -1233,7 +1267,7 @@ export function App() {
                       <span className="role-color-dot" style={{ background: role.color }} />
                       <span>
                         <strong>{role.name}</strong>
-                        <small>{role.permissions.length} permissões · posição {role.position}</small>
+                        <small>{role.permissions.length} {t('permissions')} · {t('position')} {role.position}</small>
                       </span>
                       <button className="secondary-button compact-action" onClick={() => editRole(role)}><Settings size={15} /></button>
                       <button className="danger-icon-button" onClick={() => deleteRole(role)}><Trash2 size={16} /></button>
@@ -1253,7 +1287,7 @@ export function App() {
                       <span>
                         <strong>{member.nickname || `@${member.user.username}`}</strong>
                         <small>
-                          @{member.user.username} · {member.role.toLowerCase()} · entrou {new Date(member.joinedAt).toLocaleDateString('pt-PT')}
+                          @{member.user.username} · {member.role.toLowerCase()} · {t('joined')} {new Date(member.joinedAt).toLocaleDateString()}
                           {member.timeoutUntil ? ` · timeout ${new Date(member.timeoutUntil).toLocaleString('pt-PT')}` : ''}
                         </small>
                       </span>
@@ -1262,9 +1296,9 @@ export function App() {
                           value={member.role}
                           onChange={(event) => updateMemberRole(member.user.id, event.target.value)}
                         >
-                          <option value="ADMIN">Administrador</option>
-                          <option value="MODERATOR">Moderador</option>
-                          <option value="MEMBER">Membro</option>
+                          <option value="ADMIN">{t('administrator')}</option>
+                          <option value="MODERATOR">{t('moderator')}</option>
+                          <option value="MEMBER">{t('member')}</option>
                         </select>
                       ) : <em>{member.role === 'OWNER' ? <Crown size={16} /> : member.role}</em>}
                       {canManageRoles && member.user.id !== user.id && (
@@ -1288,7 +1322,7 @@ export function App() {
                       )}
                       {canManageMessages && member.user.id !== user.id && member.role !== 'OWNER' && (
                         <button className="secondary-button compact-action" onClick={() => timeoutMember(member.user.id)}>
-                          Timeout
+                          {t('timeout')}
                         </button>
                       )}
                       {member.user.id !== user.id
@@ -1299,7 +1333,7 @@ export function App() {
                             <button
                               className="danger-icon-button"
                               onClick={() => kickMember(member.user.id, member.user.username)}
-                              title="Expulsar membro"
+                              title={t('kickMember')}
                             >
                               <DoorOpen size={17} />
                             </button>
@@ -1327,7 +1361,7 @@ export function App() {
                           <UserAvatar user={ban.user} />
                           <span>
                             <strong>@{ban.user.username}</strong>
-                            <small>{ban.reason || 'Banido'} · {new Date(ban.createdAt).toLocaleDateString('pt-PT')}</small>
+                            <small>{ban.reason || t('banned')} · {new Date(ban.createdAt).toLocaleDateString()}</small>
                           </span>
                           <button className="secondary-button" onClick={() => unbanMember(ban.user.id)}>{t('unban')}</button>
                         </div>
@@ -1340,12 +1374,12 @@ export function App() {
 
             {(server.moderationLogs?.length ?? 0) > 0 && (
               <>
-                <h3>Logs de moderação</h3>
+                <h3>{t('moderationLogs')}</h3>
                 <div className="moderation-log-list">
                   {server.moderationLogs?.map((log) => (
                     <div key={log.id}>
                       <strong>{log.action}</strong>
-                      <span>{log.actor ? `@${log.actor.username}` : 'sistema'} · {new Date(log.createdAt).toLocaleString('pt-PT')}</span>
+                      <span>{log.actor ? `@${log.actor.username}` : t('system')} · {new Date(log.createdAt).toLocaleString()}</span>
                       {log.details && <small>{log.details}</small>}
                     </div>
                   ))}
@@ -1355,10 +1389,10 @@ export function App() {
 
             {isServerOwner ? (
               <>
-                <h3>Transferir posse</h3>
+                <h3>{t('transferOwnership')}</h3>
                 <form className="management-form" onSubmit={transferOwnership}>
                   <select value={ownershipTargetId} onChange={(event) => setOwnershipTargetId(event.target.value)} required>
-                    <option value="">Escolher membro</option>
+                    <option value="">{t('chooseMember')}</option>
                     {server.members
                       .filter((member) => member.user.id !== user.id)
                       .map((member) => <option key={member.id} value={member.user.id}>@{member.user.username}</option>)}
@@ -1367,26 +1401,26 @@ export function App() {
                     type="password"
                     value={ownershipPassword}
                     onChange={(event) => setOwnershipPassword(event.target.value)}
-                    placeholder="A tua palavra-passe"
+                    placeholder={t('yourPassword')}
                     required
                   />
-                  <button className="secondary-button"><Crown size={16} /> Transferir posse</button>
+                  <button className="secondary-button"><Crown size={16} /> {t('transferOwnership')}</button>
                 </form>
-                <h3>Apagar servidor</h3>
+                <h3>{t('deleteServer')}</h3>
                 <form className="management-form danger-zone" onSubmit={deleteServer}>
                   <input
                     type="password"
                     value={serverDeletePassword}
                     onChange={(event) => setServerDeletePassword(event.target.value)}
-                    placeholder="A tua palavra-passe"
+                    placeholder={t('yourPassword')}
                     required
                   />
-                  <button className="danger-button"><Trash2 size={16} /> Apagar definitivamente</button>
+                  <button className="danger-button"><Trash2 size={16} /> {t('deleteForever')}</button>
                 </form>
               </>
             ) : (
               <button className="danger-button leave-server-button" onClick={leaveServer}>
-                <DoorOpen size={17} /> Sair do servidor
+                <DoorOpen size={17} /> {t('leaveServer')}
               </button>
             )}
           </section>

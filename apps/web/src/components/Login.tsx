@@ -5,7 +5,7 @@ import type { User } from '../types';
 import { LanguageSelect, useI18n } from '../i18n';
 
 export function Login({ onLogin }: { onLogin: (user: User) => void }) {
-  const { t } = useI18n();
+  const { t, siteConfig } = useI18n();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [initialAccount, setInitialAccount] = useState<{ username: string; password: string } | null>(null);
@@ -42,15 +42,23 @@ export function Login({ onLogin }: { onLogin: (user: User) => void }) {
 
   return (
     <div className="auth-page">
-      <div className="auth-visual">
+      <div
+        className={`auth-visual ${siteConfig.loginBackgroundUrl ? 'has-login-background' : ''}`}
+        style={siteConfig.loginBackgroundUrl ? { backgroundImage: `url(${siteConfig.loginBackgroundUrl})` } : undefined}
+      >
         <div className="orbit one" />
         <div className="orbit two" />
-        <MessageCircle size={72} />
+        {siteConfig.siteIconUrl
+          ? <img className="login-site-icon" src={siteConfig.siteIconUrl} alt="WebCord" />
+          : <MessageCircle size={72} />}
         <h1>{t('ownedConversations')}</h1>
         <p>{t('openPlatform')}</p>
       </div>
       <form className="auth-card" onSubmit={submit}>
-        <div className="brand"><span>W</span> WebCord</div>
+        <div className="brand">
+          {siteConfig.siteIconUrl ? <img src={siteConfig.siteIconUrl} alt="WebCord" /> : <span>W</span>}
+          WebCord
+        </div>
         <LanguageSelect />
         <h2>{t('welcome')}</h2>
         <p>{t('loginSubtitle')}</p>

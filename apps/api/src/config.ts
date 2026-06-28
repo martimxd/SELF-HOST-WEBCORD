@@ -19,6 +19,7 @@ export const config = z
     UPLOAD_DIR: z.string().default('./uploads'),
     LIVEKIT_API_KEY: z.string().default('devkey'),
     LIVEKIT_API_SECRET: z.string().min(32),
+    LIVEKIT_URL: z.string().url().default('http://localhost:7880'),
     GIPHY_API_KEY: z.string().default(''),
     GIPHY_RATING: z.enum(['g', 'pg', 'pg-13', 'r']).default('pg-13'),
     GIPHY_COUNTRY_CODE: z.string().length(2).default('PT'),

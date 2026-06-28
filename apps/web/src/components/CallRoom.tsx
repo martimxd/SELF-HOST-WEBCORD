@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type CSSProperties, type MouseEvent } from 'react';
 import {
   DisconnectButton,
   LayoutContextProvider,
@@ -24,16 +24,39 @@ type CallRoomProps = {
   socket: Socket;
   callKind: 'server' | 'direct';
   callTargetId: string;
+  canModerateCall?: boolean;
+  muteEndpoint?: string;
+  kickEndpoint?: string;
 };
 
-function CallStage() {
+function CallStage({
+  callKind,
+  callTargetId,
+  canModerateCall = false,
+  muteEndpoint,
+  kickEndpoint,
+  socket,
+  onForceLeave,
+}: Pick<CallRoomProps, 'callKind' | 'callTargetId' | 'canModerateCall' | 'muteEndpoint' | 'kickEndpoint' | 'socket'> & {
+  onForceLeave: () => void;
+}) {
   const { t } = useI18n();
   const room = useRoomContext();
-  const { localParticipant } = useLocalParticipant();
-  const [micEnabled, setMicEnabled] = useState(true);
-  const [cameraEnabled, setCameraEnabled] = useState(true);
-  const [screenEnabled, setScreenEnabled] = useState(false);
+  const {
+    localParticipant,
+    isMicrophoneEnabled,
+    isCameraEnabled,
+    isScreenShareEnabled,
+  } = useLocalParticipant();
   const [deafened, setDeafened] = useState(false);
+  const [volumeMenu, setVolumeMenu] = useState<{
+    identity: string;
+    x: number;
+    y: number;
+    volume: number;
+  } | null>(null);
+  const [participantVolumes, setParticipantVolumes] = useState<Record<string, number>>({});
+  const [actionError, setActionError] = useState('');
   const tracks = useTracks([
     { source: Track.Source.Camera, withPlaceholder: true },
     { source: Track.Source.ScreenShare, withPlaceholder: false },
@@ -57,26 +80,47 @@ function CallStage() {
     };
   }, [deafened, room]);
 
+  useEffect(() => {
+    const closeMenu = () => setVolumeMenu(null);
+    window.addEventListener('pointerdown', closeMenu);
+    window.addEventListener('keydown', closeMenu);
+    return () => {
+      window.removeEventListener('pointerdown', closeMenu);
+      window.removeEventListener('keydown', closeMenu);
+    };
+  }, []);
+
+  useEffect(() => {
+    const forceMuted = (payload: { kind: 'server' | 'direct'; targetId: string }) => {
+      if (payload.kind !== callKind || payload.targetId !== callTargetId) return;
+      void localParticipant.setMicrophoneEnabled(false);
+    };
+    const forceLeft = (payload: { kind: 'server' | 'direct'; targetId: string }) => {
+      if (payload.kind !== callKind || payload.targetId !== callTargetId) return;
+      onForceLeave();
+    };
+    socket.on('call:force-muted', forceMuted);
+    socket.on('call:force-left', forceLeft);
+    return () => {
+      socket.off('call:force-muted', forceMuted);
+      socket.off('call:force-left', forceLeft);
+    };
+  }, [callKind, callTargetId, localParticipant, onForceLeave, socket]);
+
   const toggleMic = async () => {
     if (deafened) {
       setDeafened(false);
       setRemoteAudioEnabled(true);
     }
-    const next = !micEnabled;
-    await localParticipant.setMicrophoneEnabled(next);
-    setMicEnabled(next);
+    await localParticipant.setMicrophoneEnabled(!isMicrophoneEnabled);
   };
 
   const toggleCamera = async () => {
-    const next = !cameraEnabled;
-    await localParticipant.setCameraEnabled(next);
-    setCameraEnabled(next);
+    await localParticipant.setCameraEnabled(!isCameraEnabled);
   };
 
   const toggleScreen = async () => {
-    const next = !screenEnabled;
-    await localParticipant.setScreenShareEnabled(next);
-    setScreenEnabled(next);
+    await localParticipant.setScreenShareEnabled(!isScreenShareEnabled);
   };
 
   const toggleDeafen = async () => {
@@ -85,13 +129,45 @@ function CallStage() {
     setRemoteAudioEnabled(!next);
     if (next) {
       await localParticipant.setMicrophoneEnabled(false);
-      setMicEnabled(false);
+    }
+  };
+
+  const setParticipantVolume = (identity: string, volume: number) => {
+    setParticipantVolumes((current) => ({ ...current, [identity]: volume }));
+    room.remoteParticipants.get(identity)?.setVolume(volume / 100);
+    setVolumeMenu((current) => current && current.identity === identity
+      ? { ...current, volume }
+      : current);
+  };
+
+  const openVolumeMenu = (event: MouseEvent, identity: string) => {
+    if (identity === localParticipant.identity) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setVolumeMenu({
+      identity,
+      x: Math.min(event.clientX, window.innerWidth - 220),
+      y: Math.min(event.clientY, window.innerHeight - 120),
+      volume: participantVolumes[identity] ?? 100,
+    });
+  };
+
+  const moderateParticipant = async (endpoint: string | undefined, identity: string) => {
+    if (!endpoint) return;
+    setActionError('');
+    try {
+      await api(endpoint, {
+        method: 'POST',
+        body: JSON.stringify({ userId: identity }),
+      });
+    } catch (err) {
+      setActionError((err as Error).message);
     }
   };
 
   return (
     <div className="call-experience">
-      <div className="call-grid" style={{ '--participant-count': tracks.length } as React.CSSProperties}>
+      <div className="call-grid" style={{ '--participant-count': tracks.length } as CSSProperties}>
         {tracks.map((trackRef) => {
           const participant = trackRef.participant;
           const hasVisibleVideo = Boolean(
@@ -111,6 +187,7 @@ function CallStage() {
             <div
               className={`call-participant ${participant.isSpeaking ? 'speaking' : ''}`}
               key={`${participant.identity}-${trackRef.source}`}
+              onContextMenu={(event) => openVolumeMenu(event, participant.identity)}
             >
               <ParticipantTile trackRef={trackRef} disableSpeakingIndicator>
                 <>{hasVisibleVideo && <VideoTrack />}</>
@@ -127,20 +204,58 @@ function CallStage() {
                 <strong>{participant.name || participant.identity}</strong>
                 {microphone?.isMuted ? <MicOff size={15} /> : <Mic size={15} />}
               </div>
+              {canModerateCall && participant.identity !== localParticipant.identity && (
+                <div className="call-admin-actions">
+                  <button
+                    type="button"
+                    onClick={() => moderateParticipant(muteEndpoint, participant.identity)}
+                    title={t('muteParticipant')}
+                  >
+                    <MicOff size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => moderateParticipant(kickEndpoint, participant.identity)}
+                    title={t('kickFromCall')}
+                  >
+                    <PhoneOff size={14} />
+                  </button>
+                </div>
+              )}
             </div>
           );
         })}
       </div>
+      {volumeMenu && (
+        <div
+          className="call-volume-menu"
+          style={{ left: volumeMenu.x, top: volumeMenu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <span>{t('participantVolume')}</span>
+          <input
+            type="range"
+            min="0"
+            max="150"
+            value={volumeMenu.volume}
+            onChange={(event) => setParticipantVolume(volumeMenu.identity, Number(event.target.value))}
+          />
+          <strong>{volumeMenu.volume}%</strong>
+        </div>
+      )}
       <div className="call-controls">
         <div className="custom-call-controls">
           <button
-            className={`lk-button ${micEnabled ? '' : 'danger-active'}`}
+            type="button"
+            className={`lk-button ${isMicrophoneEnabled ? '' : 'danger-active'}`}
             onClick={toggleMic}
-            title={micEnabled ? t('microphoneOn') : t('microphoneOff')}
+            title={isMicrophoneEnabled ? t('microphoneOn') : t('microphoneOff')}
           >
-            {micEnabled ? <Mic size={19} /> : <MicOff size={19} />}
+            {isMicrophoneEnabled ? <Mic size={19} /> : <MicOff size={19} />}
           </button>
           <button
+            type="button"
             className={`lk-button ${deafened ? 'danger-active' : ''}`}
             onClick={toggleDeafen}
             title={deafened ? t('deafenOff') : t('deafenOn')}
@@ -148,24 +263,27 @@ function CallStage() {
             {deafened ? <VolumeX size={19} /> : <Volume2 size={19} />}
           </button>
           <button
-            className={`lk-button ${cameraEnabled ? '' : 'danger-active'}`}
+            type="button"
+            className={`lk-button ${isCameraEnabled ? '' : 'danger-active'}`}
             onClick={toggleCamera}
-            title={cameraEnabled ? t('cameraOn') : t('cameraOff')}
+            title={isCameraEnabled ? t('cameraOn') : t('cameraOff')}
           >
-            {cameraEnabled ? <Video size={19} /> : <VideoOff size={19} />}
+            {isCameraEnabled ? <Video size={19} /> : <VideoOff size={19} />}
           </button>
           <button
-            className={`lk-button ${screenEnabled ? 'active' : ''}`}
+            type="button"
+            className={`lk-button ${isScreenShareEnabled ? 'active' : ''}`}
             onClick={toggleScreen}
             title={t('shareScreen')}
           >
-            {screenEnabled ? <ScreenShareOff size={19} /> : <ScreenShare size={19} />}
+            {isScreenShareEnabled ? <ScreenShareOff size={19} /> : <ScreenShare size={19} />}
           </button>
           <DisconnectButton className="lk-disconnect-button" title={t('leaveCall')}>
             <PhoneOff size={19} />
           </DisconnectButton>
         </div>
       </div>
+      {actionError && <button className="toast" onClick={() => setActionError('')}>{actionError}</button>}
       <RoomAudioRenderer />
     </div>
   );
@@ -178,6 +296,9 @@ export function CallRoom({
   socket,
   callKind,
   callTargetId,
+  canModerateCall,
+  muteEndpoint,
+  kickEndpoint,
 }: CallRoomProps) {
   const { t } = useI18n();
   const [token, setToken] = useState('');
@@ -272,7 +393,19 @@ export function CallRoom({
         }}
       >
         <LayoutContextProvider>
-          <CallStage />
+          <CallStage
+            callKind={callKind}
+            callTargetId={callTargetId}
+            canModerateCall={canModerateCall}
+            muteEndpoint={muteEndpoint}
+            kickEndpoint={kickEndpoint}
+            socket={socket}
+            onForceLeave={() => {
+              setConnected(false);
+              socket.emit('call:leave');
+              setToken('');
+            }}
+          />
         </LayoutContextProvider>
       </LiveKitRoom>
     </div>

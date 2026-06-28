@@ -40,16 +40,17 @@ import { MessageRow } from './MessageRow';
 import { ForwardDialog } from './ForwardDialog';
 import { MediaPicker } from './MediaPicker';
 import { SearchPanel } from './SearchPanel';
+import { useI18n } from '../i18n';
 
 const emptyFriends: FriendsPayload = { friends: [], incoming: [], outgoing: [], blocked: [] };
 
-function conversationPreview(content?: string | null) {
+function conversationPreview(content: string | null | undefined, t: (key: string) => string) {
   if (!content) return '';
   const callLog = content.match(
     /^\[call-log started="([^"]+)" ended="([^"]*)" duration="(\d+)"\]$/,
   );
   if (!callLog) return content;
-  return callLog[2] ? 'Chamada terminada' : 'Chamada em curso';
+  return callLog[2] ? t('callEnded') : t('callInProgress');
 }
 
 function ConversationAvatar({ conversation }: { conversation: DirectConversation }) {
@@ -81,6 +82,7 @@ export function DirectMessages({
   onActiveConversationChange: (conversationId: string) => void;
   embedded?: boolean;
 }) {
+  const { t } = useI18n();
   const [conversations, setConversations] = useState<DirectConversation[]>([]);
   const [friends, setFriends] = useState<FriendsPayload>(emptyFriends);
   const [selectedId, setSelectedId] = useState('');
@@ -329,7 +331,7 @@ export function DirectMessages({
       await copyText(
         `${window.location.origin}/?friendInvite=${result.token}`,
       );
-      setNotice('Link para adicionar amigo copiado');
+      setNotice(t('friendLinkCopied'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -349,7 +351,7 @@ export function DirectMessages({
         outgoing: current.outgoing,
         blocked: current.blocked,
       }));
-      setNotice(`@${result.friend.username} foi adicionado aos amigos`);
+      setNotice(`${t('friendAdded')}: @${result.friend.username}`);
     } catch (err) {
       setError((err as Error).message);
       await loadFriends();
@@ -371,7 +373,7 @@ export function DirectMessages({
   const blockUser = async (userId: string) => {
     await api(`/blocks/${userId}`, { method: 'POST' });
     await reload();
-    setNotice('Utilizador bloqueado');
+    setNotice(t('userBlocked'));
   };
 
   const unblockUser = async (userId: string) => {
@@ -469,7 +471,7 @@ export function DirectMessages({
         method: 'POST',
         body: JSON.stringify(gif),
       });
-      setNotice('GIF guardado nos favoritos');
+      setNotice(t('gifSavedFavorites'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -512,19 +514,34 @@ export function DirectMessages({
         ),
       );
       setDialog(null);
-      setNotice(result.nickname ? 'Apelido guardado' : 'Apelido removido');
+      setNotice(result.nickname ? t('nicknameSaved') : t('nicknameRemoved'));
     } catch (err) {
       setError((err as Error).message);
     }
   };
 
   const deleteMessage = async (message: Message) => {
-    if (!selectedId || !confirm('Apagar esta mensagem?')) return;
+    if (!selectedId || !confirm(t('deleteMessageConfirm'))) return;
     try {
       await api(`/direct-conversations/${selectedId}/messages/${message.id}`, {
         method: 'DELETE',
       });
       setMessages((items) => items.filter((item) => item.id !== message.id));
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const reactToMessage = async (message: Message, emoji: string) => {
+    if (!selectedId) return;
+    try {
+      const result = await api<{ message: Message }>(
+        `/direct-conversations/${selectedId}/messages/${message.id}/reactions`,
+        { method: 'POST', body: JSON.stringify({ emoji }) },
+      );
+      setMessages((items) =>
+        items.map((item) => item.id === message.id ? result.message : item),
+      );
     } catch (err) {
       setError((err as Error).message);
     }
@@ -562,7 +579,7 @@ export function DirectMessages({
           item.id === selected.id ? { ...item, imageUrl: result.imageUrl } : item,
         ),
       );
-      setNotice('Imagem do grupo atualizada');
+      setNotice(t('groupImageUpdated'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -575,7 +592,7 @@ export function DirectMessages({
       setConversations((items) =>
         items.map((item) => item.id === selected.id ? { ...item, imageUrl: null } : item),
       );
-      setNotice('Imagem do grupo removida');
+      setNotice(t('groupImageRemoved'));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -600,21 +617,21 @@ export function DirectMessages({
   return (
     <div className={`dm-page ${selected ? 'conversation-selected' : ''} ${embedded ? 'dm-embedded' : ''}`}>
       <aside className="dm-sidebar">
-        <header>{!embedded && <button onClick={onBack}><ArrowLeft /></button>}<strong>Mensagens</strong></header>
+        <header>{!embedded && <button onClick={onBack}><ArrowLeft /></button>}<strong>{t('directMessages')}</strong></header>
         <div className="dm-tabs">
           <button className={section === 'chats' ? 'active' : ''} onClick={() => setSection('chats')}>
-            <MessageCircle size={17} /> Conversas
+            <MessageCircle size={17} /> {t('conversations')}
           </button>
           <button className={section === 'friends' ? 'active' : ''} onClick={() => setSection('friends')}>
-            <Users size={17} /> Amigos
+            <Users size={17} /> {t('friends')}
             {friends.incoming.length > 0 && <span>{friends.incoming.length}</span>}
           </button>
         </div>
         {section === 'chats' ? (
           <>
             <div className="dm-actions">
-              <button onClick={() => setDialog('dm')}><Plus size={17} /> Nova DM</button>
-              <button onClick={() => setDialog('group')}><Users size={17} /> Novo grupo</button>
+              <button onClick={() => setDialog('dm')}><Plus size={17} /> {t('newDm')}</button>
+              <button onClick={() => setDialog('group')}><Users size={17} /> {t('newGroup')}</button>
             </div>
             <div className="dm-list">
               {conversations.map((conversation) => (
@@ -629,7 +646,7 @@ export function DirectMessages({
                   <ConversationAvatar conversation={conversation} />
                   <div>
                     <strong>{conversation.isGroup ? conversation.name : conversation.nickname || `@${conversation.otherUser?.username}`}</strong>
-                    <small>{conversationPreview(conversation.lastMessage?.content) || `${conversation.members.length} membro${conversation.members.length === 1 ? '' : 's'}`}</small>
+                    <small>{conversationPreview(conversation.lastMessage?.content, t) || `${conversation.members.length} ${t('groupMembers')}`}</small>
                   </div>
                   {(unreadCounts[conversation.id] ?? 0) > 0 && (
                     <span className="dm-unread">{Math.min(unreadCounts[conversation.id] ?? 0, 99)}</span>
@@ -641,17 +658,17 @@ export function DirectMessages({
         ) : (
           <div className="friends-panel">
             <button className="friend-link-button" onClick={copyFriendLink}>
-              <Link2 size={18} /> Copiar o meu link de amizade
+              <Link2 size={18} /> {t('copyFriendLink')}
             </button>
             <form className="friend-search" onSubmit={addFriend}>
               <input
                 value={friendUsername}
                 onChange={(event) => setFriendUsername(event.target.value)}
-                placeholder="Adicionar por username"
+                placeholder={t('addByUsername')}
               />
-              <button title="Enviar pedido"><UserPlus size={18} /></button>
+              <button title={t('sendRequest')}><UserPlus size={18} /></button>
             </form>
-            {friends.incoming.length > 0 && <h3>Pedidos recebidos</h3>}
+            {friends.incoming.length > 0 && <h3>{t('incomingRequests')}</h3>}
             {friends.incoming.map((request) => (
               <div className="friend-row" key={request.id}>
                 <UserAvatar user={request.user} />
@@ -660,40 +677,40 @@ export function DirectMessages({
                   type="button"
                   disabled={acceptingFriendId === request.id}
                   onClick={() => acceptFriend(request.id)}
-                  title="Aceitar"
+                  title={t('accept')}
                 >
                   <Check />
                 </button>
-                <button onClick={() => removeRequest(request.id)} title="Recusar"><X /></button>
+                <button onClick={() => removeRequest(request.id)} title={t('decline')}><X /></button>
               </div>
             ))}
-            {friends.outgoing.length > 0 && <h3>Pedidos enviados</h3>}
+            {friends.outgoing.length > 0 && <h3>{t('outgoingRequests')}</h3>}
             {friends.outgoing.map((request) => (
               <div className="friend-row" key={request.id}>
                 <UserAvatar user={request.user} />
                 <strong>@{request.user.username}</strong>
-                <small>Pendente</small>
-                <button onClick={() => removeRequest(request.id)} title="Cancelar"><X /></button>
+                <small>{t('pending')}</small>
+                <button onClick={() => removeRequest(request.id)} title={t('cancel')}><X /></button>
               </div>
             ))}
-            <h3>Amigos</h3>
+            <h3>{t('friends')}</h3>
             {friends.friends.map((friend) => (
               <div className="friend-row" key={friend.id}>
                 <button className="friend-profile" onClick={() => openProfile(friend.username)}>
                   <UserAvatar user={friend} />
-                  <span><strong>@{friend.username}</strong><small>{friend.status === 'online' ? 'Online' : 'Offline'}</small></span>
+                  <span><strong>@{friend.username}</strong><small>{friend.status === 'online' ? t('online') : t('offline')}</small></span>
                 </button>
-                <button onClick={() => openUsername(friend.username)} title="Mensagem"><MessageCircle /></button>
-                <button onClick={() => removeFriend(friend.id)} title="Remover amigo"><UserMinus /></button>
-                <button onClick={() => blockUser(friend.id)} title="Bloquear"><Ban /></button>
+                <button onClick={() => openUsername(friend.username)} title={t('message')}><MessageCircle /></button>
+                <button onClick={() => removeFriend(friend.id)} title={t('removeFriend')}><UserMinus /></button>
+                <button onClick={() => blockUser(friend.id)} title={t('block')}><Ban /></button>
               </div>
             ))}
-            {friends.blocked.length > 0 && <h3>Bloqueados</h3>}
+            {friends.blocked.length > 0 && <h3>{t('blocked')}</h3>}
             {friends.blocked.map((blocked) => (
               <div className="friend-row" key={blocked.id}>
                 <UserAvatar user={blocked} />
                 <strong>@{blocked.username}</strong>
-                <button onClick={() => unblockUser(blocked.id)} title="Desbloquear"><UserX /></button>
+                <button onClick={() => unblockUser(blocked.id)} title={t('unblock')}><UserX /></button>
               </div>
             ))}
           </div>
@@ -702,7 +719,7 @@ export function DirectMessages({
           <UserAvatar user={currentUser} />
           <span>
             <strong>@{currentUser.username}</strong>
-            <small>{currentUser.status === 'offline' ? 'offline' : 'online'}</small>
+            <small>{currentUser.status === 'offline' ? t('offline') : t('online')}</small>
             {currentUser.activeCall && (
               <small className="active-call-status"><Mic size={11} /> {currentUser.activeCall.label}</small>
             )}
@@ -713,7 +730,7 @@ export function DirectMessages({
         {selected ? (
           <>
             <header className="chat-header">
-              <button className="mobile-conversation-back" onClick={() => setSelectedId('')} title="Voltar às conversas">
+              <button className="mobile-conversation-back" onClick={() => setSelectedId('')} title={t('backToConversations')}>
                 <ArrowLeft />
               </button>
               <button
@@ -723,7 +740,7 @@ export function DirectMessages({
                 <ConversationAvatar conversation={selected} />
                 <strong>{title}</strong>
               </button>
-              {selected.isGroup && <span>{selected.members.length}/10 membros</span>}
+              {selected.isGroup && <span>{selected.members.length}/10 {t('groupMembers')}</span>}
               {!selected.isGroup && (
                 <button
                   className="call-action nickname-action"
@@ -731,23 +748,23 @@ export function DirectMessages({
                     setNickname(selected.nickname || '');
                     setDialog('nickname');
                   }}
-                  title="Definir apelido"
+                  title={t('setNickname')}
                 >
                   <Pencil />
                 </button>
               )}
-              <button className="push-right call-action" onClick={() => setCallMode('audio')} title="Chamada de voz"><Mic /></button>
-              <button className="call-action" onClick={() => setCallMode('video')} title="Chamada de vídeo"><Video /></button>
-              <button className="call-action" onClick={() => setSearchOpen((current) => !current)} title="Pesquisar"><SearchIcon /></button>
+              <button className="push-right call-action" onClick={() => setCallMode('audio')} title={t('voiceCall')}><Mic /></button>
+              <button className="call-action" onClick={() => setCallMode('video')} title={t('videoCall')}><Video /></button>
+              <button className="call-action" onClick={() => setSearchOpen((current) => !current)} title={t('search')}><SearchIcon /></button>
               {selected.isGroup && (
-                <label className="call-action group-image-action" title="Alterar imagem do grupo">
+                <label className="call-action group-image-action" title={t('changeGroupImage')}>
                   <Camera />
                   <input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" onChange={(event) => event.target.files?.[0] && uploadGroupImage(event.target.files[0])} />
                 </label>
               )}
-              {selected.isGroup && <button className="call-action" onClick={() => setDialog('members')} title="Membros"><Users /></button>}
+              {selected.isGroup && <button className="call-action" onClick={() => setDialog('members')} title={t('members')}><Users /></button>}
               {selected.isGroup && (
-                <button className="call-action" onClick={() => removeGroupMember(currentUser.id)} title="Sair do grupo">
+                <button className="call-action" onClick={() => removeGroupMember(currentUser.id)} title={t('leaveGroup')}>
                   <DoorOpen />
                 </button>
               )}
@@ -767,21 +784,23 @@ export function DirectMessages({
                   <div className="channel-intro">
                     <div>{selected.isGroup ? <Users /> : <MessageCircle />}</div>
                     <h1>{title}</h1>
-                    <p>{selected.isGroup ? `Grupo privado com ${selected.members.length} membros.` : 'Esta é uma conversa privada entre amigos.'}</p>
+                    <p>{selected.isGroup ? `${t('privateGroupText')} ${selected.members.length} ${t('groupMembers')}.` : t('privateDmText')}</p>
                   </div>
                   {messageCursor && (
                     <button className="load-older" disabled={loadingOlder} onClick={loadOlderMessages}>
-                      {loadingOlder ? 'A carregar…' : 'Carregar mensagens anteriores'}
+                      {loadingOlder ? t('loading') : t('loadOlderMessages')}
                     </button>
                   )}
                   {messages.map((message) => (
                     <MessageRow
                       key={message.id}
                       message={message}
+                      currentUserId={currentUser.id}
                       onReply={setReplyingTo}
                       onForward={setForwardingMessage}
                       onProfile={(author) => openProfile(author.username)}
                       onFavoriteGif={favoriteGif}
+                      onReact={reactToMessage}
                       authorDisplayName={
                         !selected.isGroup
                         && selected.nickname
@@ -803,16 +822,16 @@ export function DirectMessages({
                   )}
                   {replyingTo && (
                     <div className="replying-banner">
-                      <span>A responder a <strong>@{replyingTo.author.username}</strong></span>
+                      <span>{t('replyingTo')} <strong>@{replyingTo.author.username}</strong></span>
                       <button onClick={() => setReplyingTo(null)}>×</button>
                     </div>
                   )}
                   <form className="composer" onSubmit={send}>
-                    <label className="attach" title="Enviar anexo"><Plus /><input type="file" onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])} /></label>
-                    <input value={text} onChange={(event) => setText(event.target.value)} placeholder={`Mensagem para ${title}`} />
-                    <button type="button" onClick={() => setMediaPicker(mediaPicker === 'gifs' ? null : 'gifs')} title="Enviar GIF"><Image size={19} /></button>
-                    <button type="button" onClick={() => setMediaPicker(mediaPicker === 'favorites' ? null : 'favorites')} title="GIFs favoritos"><Heart size={19} /></button>
-                    <button type="button" onClick={() => setMediaPicker(mediaPicker === 'stickers' ? null : 'stickers')} title="Enviar figurinha"><Sticker size={19} /></button>
+                    <label className="attach" title={t('attachFile')}><Plus /><input type="file" onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])} /></label>
+                    <input value={text} onChange={(event) => setText(event.target.value)} placeholder={`${t('messageTo')} ${title}`} />
+                    <button type="button" onClick={() => setMediaPicker(mediaPicker === 'gifs' ? null : 'gifs')} title={t('sendGif')}><Image size={19} /></button>
+                    <button type="button" onClick={() => setMediaPicker(mediaPicker === 'favorites' ? null : 'favorites')} title={t('favoriteGifs')}><Heart size={19} /></button>
+                    <button type="button" onClick={() => setMediaPicker(mediaPicker === 'stickers' ? null : 'stickers')} title={t('sendSticker')}><Sticker size={19} /></button>
                     <button><Send size={20} /></button>
                   </form>
                 </div>
@@ -820,7 +839,7 @@ export function DirectMessages({
             )}
           </>
         ) : (
-          <div className="empty-state"><Search size={52} /><h1>Conversas privadas</h1><p>Adiciona pessoas pelo username e começa uma DM ou um grupo com até 10 membros.</p><button className="primary" onClick={() => setSection('friends')}>Encontrar amigos</button></div>
+          <div className="empty-state"><Search size={52} /><h1>{t('directConversations')}</h1><p>{t('directConversationsHelp')}</p><button className="primary" onClick={() => setSection('friends')}>{t('findFriends')}</button></div>
         )}
         {error && <button className="toast" onClick={() => setError('')}>{error}</button>}
         {notice && <button className="toast success-toast" onClick={() => setNotice('')}>{notice}</button>}
@@ -830,18 +849,18 @@ export function DirectMessages({
         <div className="modal-backdrop" onClick={() => setDialog(null)}>
           <section className="dialog-card" onClick={(event) => event.stopPropagation()}>
             <button className="modal-close" onClick={() => setDialog(null)}><X /></button>
-            <span className="eyebrow">NOVA DM</span>
-            <h2>Escolhe um amigo</h2>
+            <span className="eyebrow">{t('newDm')}</span>
+            <h2>{t('chooseFriend')}</h2>
             <div className="dialog-list">
               {friends.friends.map((friend) => (
                 <button key={friend.id} onClick={() => openUsername(friend.username)}>
                   <UserAvatar user={friend} />
-                  <span><strong>@{friend.username}</strong><small>{friend.status === 'online' ? 'Online' : 'Offline'}</small></span>
+                  <span><strong>@{friend.username}</strong><small>{friend.status === 'online' ? t('online') : t('offline')}</small></span>
                   <MessageCircle />
                 </button>
               ))}
             </div>
-            {!friends.friends.length && <p className="muted">Aceita um pedido de amizade antes de iniciar uma DM.</p>}
+            {!friends.friends.length && <p className="muted">{t('noFriendsForDm')}</p>}
           </section>
         </div>
       )}
@@ -850,10 +869,10 @@ export function DirectMessages({
         <div className="modal-backdrop" onClick={() => setDialog(null)}>
           <form className="dialog-card" onSubmit={createGroup} onClick={(event) => event.stopPropagation()}>
             <button type="button" className="modal-close" onClick={() => setDialog(null)}><X /></button>
-            <span className="eyebrow">GRUPO PRIVADO</span>
-            <h2>Cria um grupo</h2>
-            <label>Nome do grupo<input required minLength={2} maxLength={80} value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="Equipa do projeto" /></label>
-            <p className="muted">Podes criar o grupo vazio e adicionar até 9 amigos depois.</p>
+            <span className="eyebrow">{t('privateGroup')}</span>
+            <h2>{t('createGroup')}</h2>
+            <label>{t('groupName')}<input required minLength={2} maxLength={80} value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder={t('groupNamePlaceholder')} /></label>
+            <p className="muted">{t('groupHelp')}</p>
             <div className="dialog-list selectable">
               {friends.friends.map((friend) => (
                 <button type="button" className={selectedFriends.includes(friend.id) ? 'selected' : ''} key={friend.id} onClick={() => toggleGroupFriend(friend.id)}>
@@ -863,7 +882,7 @@ export function DirectMessages({
                 </button>
               ))}
             </div>
-            <button className="primary" disabled={selectedFriends.length > 9}>Criar grupo ({selectedFriends.length + 1}/10)</button>
+            <button className="primary" disabled={selectedFriends.length > 9}>{t('createGroupAction')} ({selectedFriends.length + 1}/10)</button>
           </form>
         </div>
       )}
@@ -872,16 +891,16 @@ export function DirectMessages({
         <div className="modal-backdrop" onClick={() => setDialog(null)}>
           <section className="dialog-card" onClick={(event) => event.stopPropagation()}>
             <button className="modal-close" onClick={() => setDialog(null)}><X /></button>
-            <span className="eyebrow">MEMBROS</span>
+            <span className="eyebrow">{t('members')}</span>
             <h2>{selected.name}</h2>
             {selected.imageUrl && (
               <button className="danger-button group-image-remove" onClick={removeGroupImage}>
-                <Trash2 size={16} /> Remover imagem do grupo
+                <Trash2 size={16} /> {t('removeGroupImage')}
               </button>
             )}
             {selected.ownerId === currentUser.id && selected.members.length < 10 && (
               <form className="friend-search" onSubmit={addGroupMember}>
-                <input value={memberUsername} onChange={(event) => setMemberUsername(event.target.value)} placeholder="Adicionar amigo por username" />
+                <input value={memberUsername} onChange={(event) => setMemberUsername(event.target.value)} placeholder={t('addFriendByUsername')} />
                 <button><UserPlus /></button>
               </form>
             )}
@@ -889,9 +908,9 @@ export function DirectMessages({
               {selected.members.map((member) => (
                 <div className="group-member-row" key={member.id}>
                   <UserAvatar user={member} />
-                  <span><strong>@{member.username}</strong><small>{member.status === 'online' ? 'Online' : 'Offline'}{member.id === selected.ownerId ? ' · Criador' : ''}</small></span>
+                  <span><strong>@{member.username}</strong><small>{member.status === 'online' ? t('online') : t('offline')}{member.id === selected.ownerId ? ` · ${t('owner')}` : ''}</small></span>
                   {(member.id === currentUser.id || (member.id !== selected.ownerId && selected.ownerId === currentUser.id)) && (
-                    <button onClick={() => removeGroupMember(member.id)} title={member.id === currentUser.id ? 'Sair do grupo' : 'Remover membro'}><UserMinus /></button>
+                    <button onClick={() => removeGroupMember(member.id)} title={member.id === currentUser.id ? t('leaveGroup') : t('removeMember')}><UserMinus /></button>
                   )}
                 </div>
               ))}
@@ -904,10 +923,10 @@ export function DirectMessages({
         <div className="modal-backdrop" onClick={() => setDialog(null)}>
           <form className="dialog-card nickname-dialog" onSubmit={saveNickname} onClick={(event) => event.stopPropagation()}>
             <button type="button" className="modal-close" onClick={() => setDialog(null)}><X /></button>
-            <span className="eyebrow">APELIDO PESSOAL</span>
-            <h2>Como queres chamar @{selected.otherUser?.username}?</h2>
+            <span className="eyebrow">{t('personalNickname')}</span>
+            <h2>{t('personalNicknameQuestion')} @{selected.otherUser?.username}?</h2>
             <label>
-              Apelido
+              {t('nickname')}
               <input
                 autoFocus
                 maxLength={40}
@@ -916,8 +935,8 @@ export function DirectMessages({
                 placeholder={selected.otherUser?.username}
               />
             </label>
-            <p className="muted">Só tu vês este apelido. Deixa vazio para voltar ao username original.</p>
-            <button className="primary">Guardar apelido</button>
+            <p className="muted">{t('personalNicknameHelp')}</p>
+            <button className="primary">{t('saveNickname')}</button>
           </form>
         </div>
       )}
@@ -953,7 +972,7 @@ export function DirectMessages({
           message={forwardingMessage}
           sourceType="direct"
           onClose={() => setForwardingMessage(null)}
-          onForwarded={() => setNotice('Mensagem reencaminhada')}
+          onForwarded={() => setNotice(t('forwardedMessage'))}
         />
       )}
     </div>

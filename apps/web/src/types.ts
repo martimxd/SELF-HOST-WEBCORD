@@ -93,6 +93,11 @@ export type Message = {
   createdAt: string;
   author: Pick<User, 'id' | 'username' | 'avatarUrl' | 'status'>;
   forwardedFrom?: string | null;
+  reactions?: Array<{
+    emoji: string;
+    count: number;
+    userIds: string[];
+  }>;
   replyTo?: {
     id: string;
     content: string;
